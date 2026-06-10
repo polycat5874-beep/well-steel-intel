@@ -1,0 +1,33 @@
+name: steel-intel realtime
+
+# Realtime watch: one fetch+alert cycle. Fires critical alerts on genuinely new
+# items only (baseline seeding handles the first run). GitHub cron is best-effort
+# and may be delayed a few minutes under load -- accepted tradeoff for $0 24/7.
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 minutes (UTC; interval is timezone-agnostic)
+  workflow_dispatch: {}        # allow manual run from the Actions tab
+
+# Never let two cycles overlap (DB writes + alert dedup must stay serial).
+concurrency:
+  group: steel-intel-run
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TZ: Asia/Bangkok
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      LINE_CHANNEL_ID: ${{ secrets.LINE_CHANNEL_ID }}
+      LINE_CHANNEL_SECRET: ${{ secrets.LINE_CHANNEL_SECRET }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python main.py --once

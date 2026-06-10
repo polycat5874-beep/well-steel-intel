@@ -1,0 +1,34 @@
+name: steel-intel daily summary
+
+# Three grouped digests per day. Cron is in UTC; with TZ=Asia/Bangkok the app's
+# round label (เช้า/เที่ยง/เย็น) is derived from local hour, so UTC must map to
+# Thai time (UTC+7):  07:00 -> 00:00 UTC | 12:00 -> 05:00 UTC | 18:00 -> 11:00 UTC
+on:
+  schedule:
+    - cron: "0 0 * * *"    # 07:00 Asia/Bangkok
+    - cron: "0 5 * * *"    # 12:00 Asia/Bangkok
+    - cron: "0 11 * * *"   # 18:00 Asia/Bangkok
+  workflow_dispatch: {}
+
+concurrency:
+  group: steel-intel-run   # shared with realtime.yml: summaries never overlap a cycle
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TZ: Asia/Bangkok
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      LINE_CHANNEL_ID: ${{ secrets.LINE_CHANNEL_ID }}
+      LINE_CHANNEL_SECRET: ${{ secrets.LINE_CHANNEL_SECRET }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python main.py --summary

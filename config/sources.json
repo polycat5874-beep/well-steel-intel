@@ -1,0 +1,80 @@
+{
+  "_comment": "7 source groups. Google News RSS is the backbone (incl. site: queries covering gov domains). gov_pages are best-effort direct scrapes - edit URLs here if a site changes layout.",
+
+  "google_news": {
+    "queries_th": [
+      "เหล็กเส้น จีน",
+      "นำเข้าเหล็ก จีน",
+      "บิลเล็ต เหล็ก นำเข้า",
+      "เศษเหล็ก นำเข้า",
+      "มอก. เหล็กเส้น",
+      "สมอ. เหล็ก",
+      "เตา IF เหล็ก",
+      "โรงงานเหล็ก สั่งปิด",
+      "ทุ่มตลาด เหล็ก",
+      "กรมการค้าต่างประเทศ เหล็ก",
+      "ศุลกากร เหล็ก ลักลอบ",
+      "กรมโรงงานอุตสาหกรรม เหล็ก",
+      "กากอุตสาหกรรม โรงงานเหล็ก",
+      "เหล็กลวดคาร์บอนสูง"
+    ],
+    "queries_en": [
+      "Thailand steel import China",
+      "Thailand anti-dumping steel",
+      "Thailand rebar standard TIS",
+      "HRC circumvention Thailand",
+      "steel billet import Thailand"
+    ],
+    "site_queries": [
+      "site:dft.go.th เหล็ก",
+      "site:tisi.go.th เหล็ก",
+      "site:customs.go.th เหล็ก",
+      "site:diw.go.th โรงงาน",
+      "site:diw.go.th เหล็ก",
+      "site:customs.go.th จับกุม",
+      "site:thaipbs.or.th เหล็ก",
+      "site:bangkokbiznews.com เหล็ก",
+      "site:thansettakij.com เหล็ก",
+      "site:thairath.co.th เหล็ก นำเข้า"
+    ],
+    "outlet_queries": [
+      "กรมโรงงานอุตสาหกรรม สั่งปิด เหล็ก",
+      "ร.ง.4 เพิกถอน โรงงานเหล็ก",
+      "กรมศุลกากร จับ ลักลอบ เหล็ก",
+      "ศุลกากร สำแดงเท็จ เหล็ก",
+      "เอกนัฏ เหล็ก มอก.",
+      "ยกเลิก มอก. เตาอินดักชั่น"
+    ]
+  },
+
+  "rss_feeds": [
+    { "name": "ประชาชาติธุรกิจ", "url": "https://www.prachachat.net/feed" },
+    { "name": "ไทยรัฐ", "url": "https://www.thairath.co.th/rss/news" },
+    { "name": "ไทยรัฐ-เศรษฐกิจ", "url": "https://www.thairath.co.th/rss/business" }
+  ],
+
+  "_rss_note": "Thai PBS / กรุงเทพธุรกิจ / ฐานเศรษฐกิจ / ISIT ไม่มี RSS ที่ใช้ได้ -> ดึงผ่าน google_news.site_queries แทน (เชื่อถือได้กว่า). กรมโรงงาน+ศุลกากร ดึงทั้ง gov_pages + site_queries + outlet_queries",
+
+  "gov_pages": [
+    {
+      "name": "กรมการค้าต่างประเทศ (DFT)",
+      "url": "https://www.dft.go.th/th-th/Home-DFT",
+      "base": "https://www.dft.go.th"
+    },
+    {
+      "name": "สมอ. (TISI)",
+      "url": "https://www.tisi.go.th/website/news",
+      "base": "https://www.tisi.go.th"
+    },
+    {
+      "name": "กรมศุลกากร",
+      "url": "https://www.customs.go.th/list_strc_simple_neted.php?ini_content=newsroom_press_release",
+      "base": "https://www.customs.go.th"
+    },
+    {
+      "name": "กรมโรงงานอุตสาหกรรม (DIW)",
+      "url": "https://www.diw.go.th/webdiw/news-all/",
+      "base": "https://www.diw.go.th"
+    }
+  ]
+}

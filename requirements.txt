@@ -1,0 +1,9 @@
+requests>=2.32
+feedparser>=6.0
+APScheduler>=3.10
+python-dotenv>=1.0
+# Cloud deploy: Postgres backend (Supabase) when DATABASE_URL is set.
+# Local-only runs (SQLite) do not import this, but installing it is harmless.
+psycopg[binary]>=3.1
+# Optional: deep AI summary (works without it - rule-based fallback)
+anthropic>=0.40
