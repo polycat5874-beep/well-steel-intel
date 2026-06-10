@@ -2,6 +2,11 @@ requests>=2.32
 feedparser>=6.0
 APScheduler>=3.10
 python-dotenv>=1.0
+# Article enrichment: robust date parsing + HTML metadata extraction.
+# Both have a pure-regex fallback in src/sources/base.py, so the system still
+# runs (less precisely) if they fail to install.
+python-dateutil>=2.8
+beautifulsoup4>=4.12
 # Cloud deploy: Postgres backend (Supabase) when DATABASE_URL is set.
 # Local-only runs (SQLite) do not import this, but installing it is harmless.
 psycopg[binary]>=3.1

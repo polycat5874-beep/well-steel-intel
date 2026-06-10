@@ -24,11 +24,18 @@ sys.path.insert(0, BASE_DIR)
 from src import storage, notifier, summarizer  # noqa: E402
 from src.matcher import Matcher  # noqa: E402
 from src.sources import google_news, rss_feeds, gov_sites  # noqa: E402
+from src.sources.base import enrich_article, summarise_text, is_junk_title  # noqa: E402
 
 log = logging.getLogger("steel_intel")
 
 SOURCES_PATH = os.path.join(BASE_DIR, "config", "sources.json")
 ROUND_LABELS = {7: "เช้า 07:00", 12: "เที่ยง 12:00", 18: "เย็น 18:00"}
+
+# Article enrichment (extra HTTP round-trip per item) is gated to high-impact
+# levels and capped per cycle, so the remote-DB collect stays well under the
+# GitHub Actions / Supabase latency budget (~58s proven baseline).
+ENRICH_LEVELS = ("RED", "ORANGE")
+ENRICH_MAX_PER_CYCLE = 12
 
 
 def load_env():
@@ -78,27 +85,51 @@ def collect_cycle(matcher_obj):
     """Fetch all 7 source groups, analyze, store new relevant items.
     Returns (n_fetched, n_new)."""
     cfg = load_sources_cfg()
+    trusted = cfg.get("trusted_sources", {})
     items = []
-    items += google_news.fetch_all(cfg.get("google_news", {}))
+    # Trust gate (anti-fake-news) applies to Google News; gov_pages + direct RSS
+    # feeds are trusted by origin.
+    items += google_news.fetch_all(cfg.get("google_news", {}), trusted)
     items += rss_feeds.fetch_all(cfg.get("rss_feeds", []))
     items += gov_sites.fetch_all(cfg.get("gov_pages", []))
 
     con = storage.connect()
     try:
         pairs = []
+        enriched = 0
         for item in items:
-            if not item.get("title"):
-                continue
+            if not item.get("title") or is_junk_title(item["title"]):
+                continue  # drop nav/page-title junk before scoring
             analysis = matcher_obj.analyze(item)
             if not analysis["is_relevant"]:
                 continue  # keep news.db focused on steel-relevant items
+            # Enrich high-impact items: fetch the article page for a precise
+            # published_datetime and a clean lead-paragraph summary. Capped per
+            # cycle to protect the remote-DB time budget.
+            # Google News links are redirect URLs we can't follow to the real
+            # article, so enrichment only helps direct (gov/RSS) URLs.
+            url = item.get("url", "")
+            is_direct = url and "news.google.com" not in url
+            if (analysis["level"] in ENRICH_LEVELS
+                    and is_direct
+                    and enriched < ENRICH_MAX_PER_CYCLE
+                    and (not item.get("published_datetime") or not item.get("summary"))):
+                dt, summ = enrich_article(item.get("url", ""))
+                if dt and not item.get("published_datetime"):
+                    item["published_datetime"] = dt
+                if summ:
+                    item["summary"] = summ
+                enriched += 1
+            # Always store a tidied summary (enriched lead or trimmed feed text).
+            item["summary"] = summarise_text(item.get("summary", ""))
             pairs.append((item, analysis))
         # Bulk insert (few round-trips) — critical for the remote-DB deployment;
         # a re-fetch is mostly duplicates and per-row inserts would time out.
         n_new = storage.insert_many(con, pairs)
     finally:
         con.close()
-    log.info("collect cycle: fetched=%d new_relevant=%d", len(items), n_new)
+    log.info("collect cycle: fetched=%d new_relevant=%d enriched=%d",
+             len(items), n_new, enriched)
     return len(items), n_new
 
 

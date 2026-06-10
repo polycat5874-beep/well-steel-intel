@@ -45,7 +45,10 @@ CREATE TABLE IF NOT EXISTS news (
     level           TEXT,
     impact_notes    TEXT,
     watchlist_hits  TEXT,
-    alerted         INTEGER DEFAULT 0
+    alerted         INTEGER DEFAULT 0,
+    published_datetime TEXT,
+    source_name        TEXT,
+    summary            TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_news_fetched ON news(fetched_at);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -67,18 +70,28 @@ PG_SCHEMA = [
         level           TEXT,
         impact_notes    TEXT,
         watchlist_hits  TEXT,
-        alerted         INTEGER DEFAULT 0
+        alerted         INTEGER DEFAULT 0,
+        published_datetime TEXT,
+        source_name        TEXT,
+        summary            TEXT
     )""",
     "CREATE INDEX IF NOT EXISTS idx_news_fetched ON news(fetched_at)",
     "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)",
 ]
+
+# Columns added after the original schema shipped. They are appended (via ALTER
+# ADD COLUMN) to any pre-existing table so deployed Supabase data is preserved.
+# They are listed LAST in CREATE TABLE too, so a freshly-created table and a
+# migrated one have the SAME column order -> `SELECT *` zips against ROW_COLS
+# identically on both paths.
+_ADDED_COLUMNS = ("published_datetime", "source_name", "summary")
 
 # Column order MUST match the table definition so `SELECT *` rows zip correctly
 # on both backends.
 ROW_COLS = (
     "id", "hash", "title", "url", "source", "published", "fetched_at",
     "topics", "critical_hits", "score", "level", "impact_notes",
-    "watchlist_hits", "alerted",
+    "watchlist_hits", "alerted", "published_datetime", "source_name", "summary",
 )
 
 
@@ -104,6 +117,10 @@ class _PgConn:
         for stmt in PG_SCHEMA:
             with self.con.cursor() as cur:
                 cur.execute(stmt)
+        # Migrate pre-existing tables: add new columns if missing (idempotent).
+        for col in _ADDED_COLUMNS:
+            with self.con.cursor() as cur:
+                cur.execute(f"ALTER TABLE news ADD COLUMN IF NOT EXISTS {col} TEXT")
         self.con.commit()
 
     @staticmethod
@@ -152,6 +169,13 @@ def connect(db_path=DB_PATH):
         return _PgConn(url)
     con = sqlite3.connect(db_path)
     con.executescript(SQLITE_SCHEMA)
+    # Migrate pre-existing tables: SQLite has no ADD COLUMN IF NOT EXISTS, so
+    # check PRAGMA first. New columns append at the end -> matches ROW_COLS.
+    existing = {row[1] for row in con.execute("PRAGMA table_info(news)").fetchall()}
+    for col in _ADDED_COLUMNS:
+        if col not in existing:
+            con.execute(f"ALTER TABLE news ADD COLUMN {col} TEXT")
+    con.commit()
     return con
 
 
@@ -163,6 +187,7 @@ def item_hash(item):
 INSERT_COLS = (
     "hash", "title", "url", "source", "published", "fetched_at",
     "topics", "critical_hits", "score", "level", "impact_notes", "watchlist_hits",
+    "published_datetime", "source_name", "summary",
 )
 
 
@@ -180,6 +205,9 @@ def _row_values(item, analysis, now):
         analysis["level"],
         json.dumps(analysis["impact_notes"], ensure_ascii=False),
         json.dumps(analysis["watchlist_hits"], ensure_ascii=False),
+        item.get("published_datetime", ""),
+        item.get("source_name") or item.get("source", ""),
+        item.get("summary", ""),
     )
 
 
@@ -229,24 +257,12 @@ def insert_if_new(con, item, analysis):
     """Insert one analyzed item. Returns True if new, False if duplicate.
     (Kept for single-item callers; collect cycles use insert_many for speed.)"""
     try:
+        now = datetime.now().isoformat(timespec="seconds")
+        cols = ", ".join(INSERT_COLS)
+        ph = ",".join(["?"] * len(INSERT_COLS))
         con.execute(
-            "INSERT INTO news (hash, title, url, source, published, fetched_at,"
-            " topics, critical_hits, score, level, impact_notes, watchlist_hits)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                item_hash(item),
-                item.get("title", ""),
-                item.get("url", ""),
-                item.get("source", ""),
-                item.get("published", ""),
-                datetime.now().isoformat(timespec="seconds"),
-                json.dumps(analysis["topics"], ensure_ascii=False),
-                json.dumps(analysis["critical_hits"], ensure_ascii=False),
-                analysis["score"],
-                analysis["level"],
-                json.dumps(analysis["impact_notes"], ensure_ascii=False),
-                json.dumps(analysis["watchlist_hits"], ensure_ascii=False),
-            ),
+            f"INSERT INTO news ({cols}) VALUES ({ph})",
+            _row_values(item, analysis, now),
         )
         con.commit()
         return True
@@ -268,9 +284,13 @@ def _row_to_dict(row):
 
 
 def get_unalerted_critical(con):
-    """Rows never alerted that hit at least one critical keyword."""
+    """Rows never alerted that warrant an instant '🚨 CRITICAL ALERT': they hit a
+    critical keyword AND are high-impact (RED/ORANGE). YELLOW critical-keyword
+    items are intentionally left for the daily summary - this keeps realtime
+    alerts genuinely critical and conserves the LINE push quota."""
     rows = con.execute(
         "SELECT * FROM news WHERE alerted = 0 AND critical_hits != '[]'"
+        " AND level IN ('RED', 'ORANGE')"
         " ORDER BY score DESC, id DESC"
     ).fetchall()
     return [_row_to_dict(r) for r in rows]

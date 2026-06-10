@@ -40,7 +40,11 @@ def fetch_all(page_cfgs):
                 "title": title,
                 "url": urljoin(base, href.strip()),
                 "source": name,
+                "source_name": name,
                 "published": "",
+                # gov listing pages rarely expose a date; enrich_article() fills
+                # this in for high-impact items by fetching the article page.
+                "published_datetime": "",
                 "summary": "",
             })
             count += 1

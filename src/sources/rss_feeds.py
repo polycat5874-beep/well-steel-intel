@@ -5,7 +5,7 @@ import logging
 
 import feedparser
 
-from .base import fetch_url
+from .base import fetch_url, parse_published
 
 log = logging.getLogger("steel_intel.sources.rss_feeds")
 
@@ -28,7 +28,11 @@ def fetch_all(feed_cfgs):
                 "title": title,
                 "url": entry.get("link", ""),
                 "source": name,
+                "source_name": name,
                 "published": entry.get("published", ""),
+                "published_datetime": parse_published(
+                    entry.get("published", ""), entry.get("published_parsed")
+                ),
                 "summary": (entry.get("summary") or "")[:500],
             })
             count += 1
