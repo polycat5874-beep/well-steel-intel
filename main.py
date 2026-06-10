@@ -84,16 +84,18 @@ def collect_cycle(matcher_obj):
     items += gov_sites.fetch_all(cfg.get("gov_pages", []))
 
     con = storage.connect()
-    n_new = 0
     try:
+        pairs = []
         for item in items:
             if not item.get("title"):
                 continue
             analysis = matcher_obj.analyze(item)
             if not analysis["is_relevant"]:
                 continue  # keep news.db focused on steel-relevant items
-            if storage.insert_if_new(con, item, analysis):
-                n_new += 1
+            pairs.append((item, analysis))
+        # Bulk insert (few round-trips) — critical for the remote-DB deployment;
+        # a re-fetch is mostly duplicates and per-row inserts would time out.
+        n_new = storage.insert_many(con, pairs)
     finally:
         con.close()
     log.info("collect cycle: fetched=%d new_relevant=%d", len(items), n_new)

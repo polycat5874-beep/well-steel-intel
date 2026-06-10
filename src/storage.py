@@ -160,8 +160,74 @@ def item_hash(item):
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+INSERT_COLS = (
+    "hash", "title", "url", "source", "published", "fetched_at",
+    "topics", "critical_hits", "score", "level", "impact_notes", "watchlist_hits",
+)
+
+
+def _row_values(item, analysis, now):
+    return (
+        item_hash(item),
+        item.get("title", ""),
+        item.get("url", ""),
+        item.get("source", ""),
+        item.get("published", ""),
+        now,
+        json.dumps(analysis["topics"], ensure_ascii=False),
+        json.dumps(analysis["critical_hits"], ensure_ascii=False),
+        analysis["score"],
+        analysis["level"],
+        json.dumps(analysis["impact_notes"], ensure_ascii=False),
+        json.dumps(analysis["watchlist_hits"], ensure_ascii=False),
+    )
+
+
+def insert_many(con, pairs, chunk=100):
+    """Bulk-insert analyzed items, skipping duplicates by hash.
+
+    `pairs` is an iterable of (item, analysis). Returns the count of NEWLY
+    inserted rows. This batches the work into a handful of multi-row INSERTs
+    (instead of one round-trip per item), which is essential when the DB is
+    remote: a full re-fetch is mostly duplicates, and per-row INSERT+rollback
+    over a high-latency link (GitHub runner -> Supabase) is ~2000 round-trips
+    and times out. ON CONFLICT(hash) DO NOTHING skips dups server-side; the
+    RETURNING clause counts only the rows actually inserted. Works on both
+    SQLite (>=3.35) and Postgres. chunk caps placeholders per statement to stay
+    under driver/SQLite variable limits."""
+    now = datetime.now().isoformat(timespec="seconds")
+    seen = set()
+    rows = []
+    for item, analysis in pairs:
+        vals = _row_values(item, analysis, now)
+        h = vals[0]
+        if h in seen:  # same headline fetched from two sources in one cycle
+            continue
+        seen.add(h)
+        rows.append(vals)
+    if not rows:
+        return 0
+
+    cols = ", ".join(INSERT_COLS)
+    one = "(" + ",".join(["?"] * len(INSERT_COLS)) + ")"
+    new_count = 0
+    for i in range(0, len(rows), chunk):
+        batch = rows[i:i + chunk]
+        placeholders = ",".join([one] * len(batch))
+        flat = [v for r in batch for v in r]
+        cur = con.execute(
+            f"INSERT INTO news ({cols}) VALUES {placeholders}"
+            " ON CONFLICT(hash) DO NOTHING RETURNING id",
+            flat,
+        )
+        new_count += len(cur.fetchall())
+    con.commit()
+    return new_count
+
+
 def insert_if_new(con, item, analysis):
-    """Insert one analyzed item. Returns True if new, False if duplicate."""
+    """Insert one analyzed item. Returns True if new, False if duplicate.
+    (Kept for single-item callers; collect cycles use insert_many for speed.)"""
     try:
         con.execute(
             "INSERT INTO news (hash, title, url, source, published, fetched_at,"
