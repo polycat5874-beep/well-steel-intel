@@ -23,6 +23,8 @@ import os
 import sqlite3
 from datetime import datetime
 
+from .sources.base import canonicalize_url
+
 log = logging.getLogger("steel_intel.storage")
 
 DB_PATH = os.path.join(
@@ -180,7 +182,11 @@ def connect(db_path=DB_PATH):
 
 
 def item_hash(item):
-    raw = (item.get("url") or "") + "|" + (item.get("title") or "")
+    # Canonicalise the URL first: the same article shared with different
+    # tracking tokens (?utm_source, ?fbclid, ...) must hash identically, or it
+    # bypasses the UNIQUE(hash) dedup and re-appears as "new".
+    url = canonicalize_url(item.get("url") or "")
+    raw = url + "|" + (item.get("title") or "")
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 

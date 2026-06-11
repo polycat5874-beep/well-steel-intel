@@ -24,7 +24,9 @@ sys.path.insert(0, BASE_DIR)
 from src import storage, notifier, summarizer  # noqa: E402
 from src.matcher import Matcher  # noqa: E402
 from src.sources import google_news, rss_feeds, gov_sites  # noqa: E402
-from src.sources.base import enrich_article, summarise_text, is_junk_title  # noqa: E402
+from src.sources.base import (  # noqa: E402
+    enrich_article, summarise_text, is_junk_title, is_fresh,
+)
 
 log = logging.getLogger("steel_intel")
 
@@ -93,10 +95,16 @@ def collect_cycle(matcher_obj):
     items += rss_feeds.fetch_all(cfg.get("rss_feeds", []))
     items += gov_sites.fetch_all(cfg.get("gov_pages", []))
 
+    # Freshness window (anti-stale): an article older than this is ignored even
+    # if it's brand-new to the DB. Timezone-aware in Asia/Bangkok (see is_fresh).
+    lookback_hours = matcher_obj.settings.get("lookback_hours", 24)
+    keep_if_unknown = not matcher_obj.settings.get("drop_if_no_date", False)
+
     con = storage.connect()
     try:
         pairs = []
         enriched = 0
+        dropped_stale = 0
         for item in items:
             if not item.get("title") or is_junk_title(item["title"]):
                 continue  # drop nav/page-title junk before scoring
@@ -120,6 +128,15 @@ def collect_cycle(matcher_obj):
                 if summ:
                     item["summary"] = summ
                 enriched += 1
+            # Lookback guard: drop anything published outside the window. Runs
+            # AFTER enrichment so an undated high-impact item gets its real date
+            # first. Empty/unparseable dates are governed by keep_if_unknown
+            # (never silently treated as "now").
+            if not is_fresh(item.get("published_datetime", ""),
+                            lookback_hours=lookback_hours,
+                            keep_if_unknown=keep_if_unknown):
+                dropped_stale += 1
+                continue
             # Always store a tidied summary (enriched lead or trimmed feed text).
             item["summary"] = summarise_text(item.get("summary", ""))
             pairs.append((item, analysis))
@@ -128,8 +145,8 @@ def collect_cycle(matcher_obj):
         n_new = storage.insert_many(con, pairs)
     finally:
         con.close()
-    log.info("collect cycle: fetched=%d new_relevant=%d enriched=%d",
-             len(items), n_new, enriched)
+    log.info("collect cycle: fetched=%d new_relevant=%d enriched=%d stale_dropped=%d",
+             len(items), n_new, enriched, dropped_stale)
     return len(items), n_new
 
 

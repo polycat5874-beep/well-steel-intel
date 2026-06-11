@@ -112,6 +112,10 @@
     "alert_max_per_cycle": 8,
     "score_red": 10,
     "score_orange": 5,
-    "score_yellow": 2
+    "score_yellow": 2,
+    "lookback_hours": 24,
+    "_lookback_note": "Freshness window: an article whose actual publication time is older than this many hours is ignored (never stored/alerted), regardless of dedup state. Comparison is timezone-aware in Asia/Bangkok.",
+    "drop_if_no_date": false,
+    "_drop_if_no_date_note": "When an item has NO parseable published date (e.g. gov listing links): false = keep it (conservative, preserves gov signal), true = drop it (strict)."
   }
 }

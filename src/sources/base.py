@@ -20,6 +20,7 @@ import logging
 import re
 import time
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 import requests
 
@@ -44,6 +45,96 @@ HEADERS = {
 
 # All times are normalised to Thailand local time for display.
 BKK_TZ = timezone(timedelta(hours=7))
+
+
+# --- URL canonicalisation (dedup hashing) --------------------------------
+
+# Tracking / analytics query params that vary per share but point at the SAME
+# article. Left in the URL they defeat dedup-by-hash: the same story arriving
+# with a fresh ?utm_source / ?fbclid hashes differently and slips past the
+# UNIQUE(hash) constraint, so an old article re-appears as "new". We strip these
+# (and the #fragment) before hashing. Meaningful params (?id=, ?p=, ?newsid=)
+# are KEPT because some CMSes use them as the article identifier.
+_TRACKING_PARAMS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "utm_id", "utm_reader", "utm_name", "utm_social", "utm_brand", "utm_referrer",
+    "fbclid", "gclid", "dclid", "gclsrc", "msclkid", "yclid", "twclid",
+    "igshid", "mc_cid", "mc_eid", "ref", "ref_src", "ref_url", "referrer",
+    "_ga", "_gl", "spm", "scm", "cmpid", "ncid", "wt.mc_id", "cmp", "source",
+}
+
+
+def canonicalize_url(url):
+    """Normalise a URL so the same article always maps to the same dedup key.
+
+    Drops tracking query params (utm_*/fbclid/gclid/...) and the #fragment,
+    lowercases scheme+host, and trims a trailing '/'. Returns '' for falsy input
+    and the original (stripped) string if it can't be parsed."""
+    if not url:
+        return ""
+    url = url.strip()
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+    if not parts.scheme and not parts.netloc:  # not a real URL (e.g. bare id)
+        return url
+    kept = [
+        (k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+        if k.lower() not in _TRACKING_PARAMS
+    ]
+    query = urlencode(kept)
+    netloc = parts.netloc.lower()
+    path = parts.path.rstrip("/") or parts.path
+    return urlunsplit((parts.scheme.lower(), netloc, path, query, ""))
+
+
+# --- Freshness / lookback window -----------------------------------------
+
+def now_bkk():
+    """Timezone-aware 'now' in Asia/Bangkok (NOT the server's local/UTC clock)."""
+    return datetime.now(tz=BKK_TZ)
+
+
+def _parse_bkk(iso_str):
+    """Parse a stored published_datetime back into a tz-aware Asia/Bangkok
+    datetime. Our stored strings are 'YYYY-MM-DDTHH:MM:SS' (BKK, naive); a naive
+    value is tagged BKK, an offset-bearing one is converted. None if unparseable."""
+    if not iso_str:
+        return None
+    s = str(iso_str).strip()
+    dt = None
+    if _dateutil_parser is not None:
+        try:
+            dt = _dateutil_parser.parse(s)
+        except (ValueError, OverflowError, TypeError):
+            return None
+    else:
+        try:
+            dt = datetime.fromisoformat(s)
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=BKK_TZ)
+    return dt.astimezone(BKK_TZ)
+
+
+def is_fresh(published_iso, lookback_hours=24, keep_if_unknown=True, now=None):
+    """True if the article was published within `lookback_hours`.
+
+    Comparison is fully timezone-aware in Asia/Bangkok, so a UTC server clock
+    can't make a Thai article look 7h younger. An empty/unparseable date is
+    NEVER silently treated as 'now' (that is exactly what lets an undated old
+    article masquerade as new); instead `keep_if_unknown` decides: keep it
+    (True, conservative — e.g. gov listing links that expose no date) or drop it
+    (False, strict). A future timestamp (clock skew) counts as fresh."""
+    now = now or now_bkk()
+    dt = _parse_bkk(published_iso)
+    if dt is None:
+        return keep_if_unknown
+    if dt > now:
+        return True
+    return (now - dt) <= timedelta(hours=lookback_hours)
 
 
 def fetch_url(url, timeout=20, retries=3, backoff=4):
