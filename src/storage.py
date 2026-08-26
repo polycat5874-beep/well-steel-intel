@@ -289,17 +289,35 @@ def _row_to_dict(row):
     return d
 
 
-def get_unalerted_critical(con):
-    """Rows never alerted that warrant an instant '🚨 CRITICAL ALERT': they hit a
-    critical keyword AND are high-impact (RED/ORANGE). YELLOW critical-keyword
-    items are intentionally left for the daily summary - this keeps realtime
-    alerts genuinely critical and conserves the LINE push quota."""
+def get_unalerted_critical(con, priority_keywords=None):
+    """Rows never alerted that warrant an instant '🚨 CRITICAL ALERT'.
+
+    Two ways in:
+      1. RED/ORANGE with any critical keyword - high measured impact.
+      2. YELLOW whose critical keywords include a *priority* one (TIS standards,
+         IF furnaces, anti-dumping). These decide whether this company can keep
+         producing at all, so a middling score must not bury them in the digest.
+
+    Every other YELLOW stays in the daily summary, which keeps realtime alerts
+    genuinely critical and conserves the LINE push quota.
+    """
     rows = con.execute(
         "SELECT * FROM news WHERE alerted = 0 AND critical_hits != '[]'"
-        " AND level IN ('RED', 'ORANGE')"
+        " AND level IN ('RED', 'ORANGE', 'YELLOW')"
         " ORDER BY score DESC, id DESC"
     ).fetchall()
-    return [_row_to_dict(r) for r in rows]
+    priority = [k.lower() for k in (priority_keywords or [])]
+    out = []
+    for r in rows:
+        row = _row_to_dict(r)
+        if row.get("level") in ("RED", "ORANGE"):
+            out.append(row)
+            continue
+        # _row_to_dict has already decoded critical_hits into a list.
+        hits = row.get("critical_hits") or []
+        if any(str(h).lower() in priority for h in hits):
+            out.append(row)
+    return out
 
 
 def mark_alerted(con, ids):

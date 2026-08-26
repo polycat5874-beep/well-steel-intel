@@ -1,113 +1,241 @@
 {
   "critical_keywords": [
-    "AD", "Anti-Dumping", "Anti Dumping", "Safeguard", "Circumvention",
-    "หลบเลี่ยง AD", "ทุ่มตลาด", "เซฟการ์ด",
-    "Steel Import", "Chinese Steel", "Billet Import", "Scrap Import",
-    "HRC", "Wire Rod", "Rebar", "H-Beam",
-    "มอก.", "สมอ.", "กรมการค้าต่างประเทศ",
-    "ศุลกากร", "ลักลอบนำเข้า", "สำแดงเท็จ", "หลีกเลี่ยงอากร",
-    "กรมโรงงาน", "สั่งปิดโรงงาน", "เพิกถอนใบอนุญาต", "ร.ง.4", "กากอุตสาหกรรม"
+    "AD",
+    "Anti-Dumping",
+    "Anti Dumping",
+    "Safeguard",
+    "Circumvention",
+    "หลบเลี่ยง AD",
+    "ทุ่มตลาด",
+    "เซฟการ์ด",
+    "Steel Import",
+    "Chinese Steel",
+    "Billet Import",
+    "Scrap Import",
+    "HRC",
+    "Wire Rod",
+    "Rebar",
+    "H-Beam",
+    "มอก.",
+    "สมอ.",
+    "กรมการค้าต่างประเทศ",
+    "ศุลกากร",
+    "ลักลอบนำเข้า",
+    "สำแดงเท็จ",
+    "หลีกเลี่ยงอากร",
+    "กรมโรงงาน",
+    "สั่งปิดโรงงาน",
+    "เพิกถอนใบอนุญาต",
+    "ร.ง.4",
+    "กากอุตสาหกรรม"
   ],
-
   "topics": {
     "rebar_china": {
       "name": "เหล็กเส้นจากจีน",
-      "keywords": ["เหล็กเส้น", "เหล็กข้ออ้อย", "เหล็กเส้นกลม", "rebar", "เหล็กจีน"]
+      "keywords": [
+        "เหล็กเส้น",
+        "เหล็กข้ออ้อย",
+        "เหล็กเส้นกลม",
+        "rebar",
+        "เหล็กจีน"
+      ]
     },
     "billet_import": {
       "name": "Billet นำเข้า",
-      "keywords": ["บิลเล็ต", "billet", "เหล็กแท่ง"]
+      "keywords": [
+        "บิลเล็ต",
+        "billet",
+        "เหล็กแท่ง"
+      ]
     },
     "scrap_import": {
       "name": "Scrap นำเข้า",
-      "keywords": ["เศษเหล็ก", "scrap", "สแครป"]
+      "keywords": [
+        "เศษเหล็ก",
+        "scrap",
+        "สแครป"
+      ]
     },
     "tis_standard": {
       "name": "มอก. / สมอ.",
-      "keywords": ["มอก.", "สมอ.", "มาตรฐานผลิตภัณฑ์อุตสาหกรรม", "TISI"]
+      "keywords": [
+        "มอก.",
+        "สมอ.",
+        "มาตรฐานผลิตภัณฑ์อุตสาหกรรม",
+        "TISI"
+      ]
     },
     "if_eaf_factory": {
       "name": "โรงงานเหล็ก IF/EAF",
-      "keywords": ["เตา IF", "Induction Furnace", "เตาอินดักชั่น", "EAF", "Electric Arc Furnace", "โรงหลอมเหล็ก", "โรงงานเหล็ก"]
+      "keywords": [
+        "เตา IF",
+        "Induction Furnace",
+        "เตาอินดักชั่น",
+        "EAF",
+        "Electric Arc Furnace",
+        "โรงหลอมเหล็ก",
+        "โรงงานเหล็ก"
+      ]
     },
     "ad_measures": {
       "name": "มาตรการ AD ใหม่ (กรมการค้าต่างประเทศ)",
-      "keywords": ["ทุ่มตลาด", "Anti-Dumping", "AD", "Safeguard", "เซฟการ์ด", "มาตรการตอบโต้", "กรมการค้าต่างประเทศ", "Circumvention", "หลบเลี่ยง", "ไต่สวน"]
+      "keywords": [
+        "ทุ่มตลาด",
+        "Anti-Dumping",
+        "AD",
+        "Safeguard",
+        "เซฟการ์ด",
+        "มาตรการตอบโต้",
+        "กรมการค้าต่างประเทศ",
+        "Circumvention",
+        "หลบเลี่ยง",
+        "ไต่สวน"
+      ]
     },
     "import_volume": {
       "name": "ปริมาณนำเข้าเหล็ก จีน/เวียดนาม/อินโดนีเซีย",
-      "keywords": ["นำเข้าเหล็ก", "Steel Import", "เหล็กเวียดนาม", "เหล็กอินโดนีเซีย", "เหล็กจีน", "ปริมาณนำเข้า"]
+      "keywords": [
+        "นำเข้าเหล็ก",
+        "Steel Import",
+        "เหล็กเวียดนาม",
+        "เหล็กอินโดนีเซีย",
+        "เหล็กจีน",
+        "ปริมาณนำเข้า"
+      ]
     },
     "customs_enforcement": {
       "name": "ศุลกากร จับกุม/ลักลอบ/สำแดงเท็จ",
-      "keywords": ["ศุลกากร", "ลักลอบนำเข้า", "สำแดงเท็จ", "หลีกเลี่ยงอากร", "จับกุม", "ของกลาง", "แหลมฉบัง"]
+      "keywords": [
+        "ศุลกากร",
+        "ลักลอบนำเข้า",
+        "สำแดงเท็จ",
+        "หลีกเลี่ยงอากร",
+        "จับกุม",
+        "ของกลาง",
+        "แหลมฉบัง"
+      ]
     },
     "diw_factory": {
       "name": "กรมโรงงาน (ร.ง.4/สั่งปิด/กากอุตสาหกรรม)",
-      "keywords": ["กรมโรงงาน", "ร.ง.4", "สั่งปิดโรงงาน", "เพิกถอนใบอนุญาต", "กากอุตสาหกรรม", "สก.2", "ฝุ่นแดง", "ตะกรัน"]
+      "keywords": [
+        "กรมโรงงาน",
+        "ร.ง.4",
+        "สั่งปิดโรงงาน",
+        "เพิกถอนใบอนุญาต",
+        "กากอุตสาหกรรม",
+        "สก.2",
+        "ฝุ่นแดง",
+        "ตะกรัน"
+      ]
     }
   },
-
   "company_profile": {
     "_comment": "[redacted]",
     "boosts": [
       {
-        "keywords": ["เตา IF", "Induction Furnace", "เตาอินดักชั่น", "ยกเลิกเตา IF", "ตัดเหล็ก IF", "แบน IF"],
+        "keywords": [
+          "เตา IF",
+          "Induction Furnace",
+          "เตาอินดักชั่น",
+          "ยกเลิกเตา IF",
+          "ตัดเหล็ก IF",
+          "แบน IF"
+        ],
         "score": 5,
         "note": "[redacted]"
       },
       {
-        "keywords": ["มอก. 24", "มอก.24", "มอก. 20", "มอก.20", "เหล็กเส้นข้ออ้อย", "เหล็กเส้นกลม"],
+        "keywords": [
+          "มอก. 24",
+          "มอก.24",
+          "มอก. 20",
+          "มอก.20",
+          "เหล็กเส้นข้ออ้อย",
+          "เหล็กเส้นกลม"
+        ],
         "score": 4,
         "note": "สินค้าหลักคือเหล็กเส้น มอก. 24/20 — กระทบสินค้าโดยตรง"
       },
       {
-        "keywords": ["เหล็กลวดคาร์บอนสูง", "Wire Rod"],
+        "keywords": [
+          "เหล็กลวดคาร์บอนสูง",
+          "Wire Rod"
+        ],
         "score": 3,
         "note": "เกาะติดต่ออายุ AD เหล็กลวดคาร์บอนสูงจีน ครบกำหนด พ.ค. 2026"
       },
       {
-        "keywords": ["เศษเหล็ก", "scrap", "สแครป"],
+        "keywords": [
+          "เศษเหล็ก",
+          "scrap",
+          "สแครป"
+        ],
         "score": 2,
         "note": "วัตถุดิบหลัก 90% คือเศษเหล็กในประเทศ — กระทบต้นทุนวัตถุดิบ"
       },
       {
-        "keywords": ["HRC", "Circumvention", "หลบเลี่ยง AD"],
+        "keywords": [
+          "HRC",
+          "Circumvention",
+          "หลบเลี่ยง AD"
+        ],
         "score": 2,
         "note": "เฝ้าการหลบเลี่ยง AD เหล็ก HRC จากจีน"
       },
       {
-        "keywords": ["[redacted]", "[redacted]", "[redacted]", "[redacted]"],
+        "keywords": [
+          "[redacted]",
+          "[redacted]",
+          "[redacted]",
+          "[redacted]"
+        ],
         "score": 2,
         "note": "[redacted]"
       }
     ]
   },
-
   "watchlist": [
     {
       "id": "ad_hc_wire_rod_2026",
       "title": "ต่ออายุ AD เหล็กลวดคาร์บอนสูงจากจีน (12.26%–36.79%)",
       "deadline": "2026-05-31",
-      "keywords": ["เหล็กลวดคาร์บอนสูง", "Wire Rod", "ต่ออายุ", "ทบทวน", "AD"],
+      "keywords": [
+        "เหล็กลวดคาร์บอนสูง",
+        "Wire Rod",
+        "ต่ออายุ",
+        "ทบทวน",
+        "AD"
+      ],
       "note": "มาตรการเดิมครบกำหนด พ.ค. 2026 — เฝ้าผลทบทวนต่ออายุ"
     },
     {
       "id": "tis_if_amendment",
       "title": "แก้ มอก. 24-2559/20-2559 ตัดเหล็กเส้นจากเตา IF",
       "deadline": null,
-      "keywords": ["เตา IF", "Induction", "มอก. 24", "มอก. 20", "แก้มาตรฐาน", "ยกเลิก IF", "เหล็กเส้น"],
+      "keywords": [
+        "เตา IF",
+        "Induction",
+        "มอก. 24",
+        "มอก. 20",
+        "แก้มาตรฐาน",
+        "ยกเลิก IF",
+        "เหล็กเส้น"
+      ],
       "note": "[redacted]"
     },
     {
       "id": "hrc_circumvention",
       "title": "ไต่สวนหลบเลี่ยง AD (Circumvention) เหล็ก HRC จากจีน",
       "deadline": null,
-      "keywords": ["HRC", "Circumvention", "หลบเลี่ยง", "ไต่สวน"],
+      "keywords": [
+        "HRC",
+        "Circumvention",
+        "หลบเลี่ยง",
+        "ไต่สวน"
+      ],
       "note": "เฝ้าผลไต่สวน/ประกาศกรมการค้าต่างประเทศ"
     }
   ],
-
   "settings": {
     "alert_max_per_cycle": 8,
     "score_red": 10,
@@ -116,6 +244,19 @@
     "lookback_hours": 24,
     "_lookback_note": "Freshness window: an article whose actual publication time is older than this many hours is ignored (never stored/alerted), regardless of dedup state. Comparison is timezone-aware in Asia/Bangkok.",
     "drop_if_no_date": false,
-    "_drop_if_no_date_note": "When an item has NO parseable published date (e.g. gov listing links): false = keep it (conservative, preserves gov signal), true = drop it (strict)."
+    "_drop_if_no_date_note": "When an item has NO parseable published date (e.g. gov listing links): false = keep it (conservative, preserves gov signal), true = drop it (strict).",
+    "priority_alert_keywords": [
+      "มอก.",
+      "สมอ.",
+      "AD",
+      "Anti-Dumping",
+      "Anti Dumping",
+      "ทุ่มตลาด",
+      "Safeguard",
+      "เซฟการ์ด",
+      "Circumvention",
+      "หลบเลี่ยง AD"
+    ],
+    "_priority_alert_note": "Critical keywords so central to this company's survival (TIS standards on rebar / IF furnaces, and anti-dumping measures) that a YELLOW item mentioning one still fires an instant alert instead of waiting for the daily digest. Everything else still needs RED/ORANGE. Rationale: the 2026-08-26 headline 'ขยับ 4 มอก. เป็นสินค้าควบคุม' scored exactly 4 (YELLOW) and would have been silently digested."
   }
 }

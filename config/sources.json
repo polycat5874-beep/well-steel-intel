@@ -1,25 +1,90 @@
 {
   "_comment": "Source groups. Google News RSS is the backbone (incl. site: queries covering gov domains). gov_pages are best-effort direct scrapes - edit URLs here if a site changes layout. trusted_sources is the ANTI-FAKE-NEWS whitelist: Google News items whose publisher is NOT on the list are dropped.",
-
   "trusted_sources": {
-    "_comment": "Anti-fake-news whitelist. gov_pages + direct rss_feeds are trusted by origin. Google News items are KEPT ONLY IF their publisher matches a publisher_alias below. Matching is case-insensitive substring on the publisher name Google attaches to each item.",
-    "gov_domains": ["dft.go.th", "tisi.go.th", "customs.go.th", "diw.go.th", "ratchakitcha.soc.go.th"],
-    "industry_domains": ["isit.or.th"],
-    "business_domains": ["bangkokbiznews.com", "prachachat.net", "thansettakij.com", "mgronline.com"],
+    "_comment": "Anti-fake-news whitelist. gov_pages + direct rss_feeds are trusted by origin. Google News items are KEPT ONLY IF their publisher matches a publisher_alias below. Matching is case-insensitive substring on the publisher name Google attaches to each item. IMPORTANT: only publisher_aliases is enforced in code; the *_domains lists are documentation. Add new outlets to publisher_aliases or they stay blocked.",
+    "gov_domains": [
+      "dft.go.th",
+      "tisi.go.th",
+      "customs.go.th",
+      "diw.go.th",
+      "ratchakitcha.soc.go.th"
+    ],
+    "industry_domains": [
+      "isit.or.th"
+    ],
+    "business_domains": [
+      "bangkokbiznews.com",
+      "prachachat.net",
+      "thansettakij.com",
+      "mgronline.com"
+    ],
     "publisher_aliases": [
-      "ประชาชาติ", "prachachat",
-      "กรุงเทพธุรกิจ", "bangkokbiznews", "bangkok biznews",
-      "ฐานเศรษฐกิจ", "thansettakij",
-      "ผู้จัดการ", "mgr online", "mgronline", "manager online",
-      "สถาบันเหล็ก", "isit",
-      "กรมการค้าต่างประเทศ", "dft",
-      "สมอ.", "สำนักงานมาตรฐานผลิตภัณฑ์", "tisi",
-      "กรมศุลกากร", "customs",
-      "กรมโรงงาน", "diw",
-      "ราชกิจจานุเบกษา", "ราชกิจจา", "ratchakitcha"
+      "ประชาชาติ",
+      "prachachat",
+      "กรุงเทพธุรกิจ",
+      "bangkokbiznews",
+      "bangkok biznews",
+      "ฐานเศรษฐกิจ",
+      "thansettakij",
+      "ผู้จัดการ",
+      "mgr online",
+      "mgronline",
+      "manager online",
+      "สถาบันเหล็ก",
+      "isit",
+      "กรมการค้าต่างประเทศ",
+      "dft",
+      "สมอ.",
+      "สำนักงานมาตรฐานผลิตภัณฑ์",
+      "tisi",
+      "กรมศุลกากร",
+      "customs",
+      "กรมโรงงาน",
+      "diw",
+      "ราชกิจจานุเบกษา",
+      "ราชกิจจา",
+      "ratchakitcha",
+      "มติชน",
+      "matichon",
+      "แนวหน้า",
+      "naewna",
+      "ไทยรัฐ",
+      "thairath",
+      "เดลินิวส์",
+      "dailynews",
+      "ข่าวสด",
+      "khaosod",
+      "สยามรัฐ",
+      "siamrath",
+      "ไทยพีบีเอส",
+      "thai pbs",
+      "thaipbs",
+      "โพสต์ทูเดย์",
+      "posttoday",
+      "ท็อปนิวส์",
+      "topnews",
+      "the standard",
+      "workpoint",
+      "bangkok post",
+      "bangkokpost",
+      "nationthailand",
+      "the nation",
+      "อินโฟเควสท์",
+      "infoquest",
+      "reuters",
+      "รอยเตอร์",
+      "bloomberg",
+      "steelorbis",
+      "kallanish",
+      "fastmarkets",
+      "argus media",
+      "s&p global",
+      "platts",
+      "mysteel",
+      "สภาอุตสาหกรรม",
+      "สมาคมเหล็ก"
     ]
   },
-
   "google_news": {
     "queries_th": [
       "เหล็กเส้น จีน",
@@ -66,17 +131,17 @@
       "ยกเลิก มอก. เตาอินดักชั่น"
     ]
   },
-
   "rss_feeds": [
-    { "name": "ประชาชาติธุรกิจ", "url": "https://www.prachachat.net/feed" }
+    {
+      "name": "ประชาชาติธุรกิจ",
+      "url": "https://www.prachachat.net/feed"
+    }
   ],
-
   "_rss_note": "Whitelist-only: direct RSS kept ONLY for ประชาชาติธุรกิจ (in trusted_sources + working feed). กรุงเทพธุรกิจ/ฐานเศรษฐกิจ/ผู้จัดการ/ISIT ดึงผ่าน google_news.site_queries + ผ่าน trust gate. ไทยรัฐ/มติชน/เดลินิวส์ ฯลฯ ถูกตัดออก (ไม่อยู่ใน whitelist ตามคำสั่งผู้กอง). กรมโรงงาน+ศุลกากร ดึงทั้ง gov_pages + site_queries + outlet_queries",
-
   "gov_pages": [
     {
       "name": "กรมการค้าต่างประเทศ (DFT)",
-      "url": "https://www.dft.go.th/th-th/Home-DFT",
+      "url": "https://www.dft.go.th/th-th/dft-service-data-gov-news",
       "base": "https://www.dft.go.th"
     },
     {

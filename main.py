@@ -160,7 +160,8 @@ def realtime_job(matcher_obj):
 
     con = storage.connect()
     try:
-        pending = storage.get_unalerted_critical(con)
+        pending = storage.get_unalerted_critical(
+            con, matcher_obj.settings.get("priority_alert_keywords", []))
         if not pending:
             log.info("no critical news pending alert")
             return

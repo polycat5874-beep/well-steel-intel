@@ -1,4 +1,7 @@
 requests>=2.32
+# imported directly by sources/base.py to build a CA bundle that includes
+# intermediates some Thai gov servers fail to send (dft.go.th).
+certifi>=2024.2.2
 feedparser>=6.0
 APScheduler>=3.10
 python-dotenv>=1.0

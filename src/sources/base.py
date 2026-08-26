@@ -15,9 +15,12 @@ Three responsibilities live here so every source module behaves consistently:
 `python-dateutil` and `beautifulsoup4` are preferred but OPTIONAL: if either is
 missing the code degrades to pure-regex parsing rather than failing to import.
 """
+import glob
 import html
 import logging
+import os
 import re
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
@@ -137,11 +140,56 @@ def is_fresh(published_iso, lookback_hours=24, keep_if_unknown=True, now=None):
     return (now - dt) <= timedelta(hours=lookback_hours)
 
 
+CERTS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "certs",
+)
+_ca_bundle_path = None
+
+
+def ca_bundle():
+    """Path to a CA bundle = certifi's roots + every extra PEM in certs/.
+
+    Some Thai government servers serve an INCOMPLETE chain: dft.go.th presents
+    only its leaf and omits the GeoTrust intermediate, so verification fails
+    with "unable to get local issuer certificate" even though the certificate
+    is perfectly valid. Supplying the intermediate ourselves fixes the chain
+    while keeping verification fully ON (never verify=False - that would accept
+    a forged certificate from any source we scrape).
+
+    Falls back to requests' default behaviour if anything here fails.
+    """
+    global _ca_bundle_path
+    if _ca_bundle_path is not None:
+        return _ca_bundle_path
+    try:
+        import certifi
+
+        extras = sorted(glob.glob(os.path.join(CERTS_DIR, "*.pem")))
+        if not extras:
+            _ca_bundle_path = certifi.where()
+            return _ca_bundle_path
+        fd, path = tempfile.mkstemp(prefix="steel-intel-ca-", suffix=".pem")
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            with open(certifi.where(), encoding="utf-8") as roots:
+                out.write(roots.read())
+            for extra in extras:
+                with open(extra, encoding="utf-8") as pem:
+                    out.write("\n" + pem.read())
+        log.info("CA bundle: certifi + %d extra intermediate(s)", len(extras))
+        _ca_bundle_path = path
+    except Exception as exc:  # never let cert plumbing kill a collect cycle
+        log.warning("CA bundle build failed (%s); using requests default", exc)
+        _ca_bundle_path = True  # requests' default verification
+    return _ca_bundle_path
+
+
 def fetch_url(url, timeout=20, retries=3, backoff=4):
     """GET url with retry. Returns response text, or None if all attempts fail."""
     for attempt in range(1, retries + 1):
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=timeout)
+            resp = requests.get(url, headers=HEADERS, timeout=timeout,
+                                verify=ca_bundle())
             resp.raise_for_status()
             return resp.text
         except requests.RequestException as exc:
