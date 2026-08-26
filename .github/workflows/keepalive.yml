@@ -1,0 +1,45 @@
+name: steel-intel keepalive
+
+# GitHub disables scheduled workflows automatically after 60 days without any
+# repository activity. That is exactly what silenced realtime.yml + summary.yml
+# on 2026-08-10 (last human commit was 2026-06-11). This job touches a heartbeat
+# file and pushes it twice a month, which resets that 60-day clock, and then
+# re-enables the two scheduled workflows as a belt-and-braces second line.
+on:
+  schedule:
+    - cron: "17 4 3,18 * *"   # 3rd + 18th of each month, 11:17 Asia/Bangkok
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # push the heartbeat commit
+  actions: write    # re-enable the scheduled workflows
+
+concurrency:
+  group: steel-intel-keepalive
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      # A real content change is used rather than `commit --allow-empty`: empty
+      # commits are not reliably counted as repository activity by GitHub.
+      - name: Touch heartbeat and push
+        run: |
+          set -euo pipefail
+          date -u +"last keepalive: %Y-%m-%dT%H:%M:%SZ" > .github/keepalive-heartbeat.txt
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/keepalive-heartbeat.txt
+          git commit -m "chore(keepalive): reset 60-day scheduled-workflow inactivity timer"
+          git push
+
+      - name: Re-enable scheduled workflows if GitHub disabled them
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow enable realtime.yml --repo "$GITHUB_REPOSITORY" || true
+          gh workflow enable summary.yml  --repo "$GITHUB_REPOSITORY" || true
