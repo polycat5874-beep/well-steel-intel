@@ -93,7 +93,9 @@
       "komchadluek",
       "ไทยโพสต์",
       "thaipost",
-      "spacebar"
+      "spacebar",
+      "mreport",
+      "เอ็มรีพอร์ต"
     ]
   },
   "google_news": {
@@ -136,7 +138,13 @@
       "site:thansettakij.com เหล็ก",
       "site:prachachat.net เหล็ก",
       "site:mgronline.com เหล็ก",
-      "site:industry.go.th เหล็ก"
+      "site:industry.go.th เหล็ก",
+      "site:mreport.co.th เหล็ก",
+      "site:iiu.isit.or.th เหล็ก",
+      "site:kaohoon.com เหล็ก",
+      "site:nationtv.tv เหล็ก",
+      "site:thaipost.net เหล็ก",
+      "site:industry.go.th มอก. เหล็ก"
     ],
     "outlet_queries": [
       "กรมโรงงานอุตสาหกรรม สั่งปิด เหล็ก",
