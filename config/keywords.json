@@ -27,7 +27,11 @@
     "สั่งปิดโรงงาน",
     "เพิกถอนใบอนุญาต",
     "ร.ง.4",
-    "กากอุตสาหกรรม"
+    "กากอุตสาหกรรม",
+    "สมาคมเหล็ก",
+    "เหล็กทรงยาว",
+    "เตาอาร์กไฟฟ้า",
+    "กมอ."
   ],
   "topics": {
     "rebar_china": {
@@ -127,11 +131,48 @@
         "ฝุ่นแดง",
         "ตะกรัน"
       ]
+    },
+    "steel_associations": {
+      "name": "สมาคม/สมาพันธ์อุตสาหกรรมเหล็ก",
+      "keywords": [
+        "สมาคมเหล็ก",
+        "สมาคมผู้ผลิตเหล็ก",
+        "เหล็กทรงยาว",
+        "เตาอาร์กไฟฟ้า",
+        "อาร์กไฟฟ้า",
+        "EAF",
+        "กมอ.",
+        "กลุ่มอุตสาหกรรมเหล็ก",
+        "สถาบันเหล็ก"
+      ]
     }
   },
   "company_profile": {
     "_comment": "[redacted]",
     "boosts": [
+      {
+        "keywords": [
+          "เหล็กทรงยาว",
+          "เตาอาร์กไฟฟ้า",
+          "อาร์กไฟฟ้า",
+          "EAF",
+          "10 สมาคมเหล็ก",
+          "สมาคมเหล็กทรงยาว"
+        ],
+        "score": 4,
+        "note": "[redacted]"
+      },
+      {
+        "keywords": [
+          "ผู้ประกอบการเตาอินดักชั่น",
+          "ผู้ค้า IF",
+          "ผู้ผลิตเหล็ก IF",
+          "หลอมโลหะด้วยเตาอินดักชั่น",
+          "กลุ่มทุนเตา IF"
+        ],
+        "score": 3,
+        "note": "[redacted]"
+      },
       {
         "keywords": [
           "เตา IF",
@@ -234,6 +275,20 @@
         "ไต่สวน"
       ],
       "note": "เฝ้าผลไต่สวน/ประกาศกรมการค้าต่างประเทศ"
+    },
+    {
+      "id": "tis_if_association_fight",
+      "title": "ศึก มอก. เตา IF — 10 สมาคมเหล็ก/EAF ปะทะ ฝ่ายผู้ประกอบการเตา IF",
+      "deadline": null,
+      "keywords": [
+        "สมาคมเหล็ก",
+        "เหล็กทรงยาว",
+        "เตาอาร์กไฟฟ้า",
+        "เตา IF",
+        "กมอ.",
+        "มอก."
+      ],
+      "note": "[redacted]"
     }
   ],
   "settings": {
@@ -255,7 +310,11 @@
       "Safeguard",
       "เซฟการ์ด",
       "Circumvention",
-      "หลบเลี่ยง AD"
+      "หลบเลี่ยง AD",
+      "สมาคมเหล็ก",
+      "เหล็กทรงยาว",
+      "เตาอาร์กไฟฟ้า",
+      "กมอ."
     ],
     "_priority_alert_note": "Critical keywords so central to this company's survival (TIS standards on rebar / IF furnaces, and anti-dumping measures) that a YELLOW item mentioning one still fires an instant alert instead of waiting for the daily digest. Everything else still needs RED/ORANGE. Rationale: the 2026-08-26 headline 'ขยับ 4 มอก. เป็นสินค้าควบคุม' scored exactly 4 (YELLOW) and would have been silently digested."
   }
