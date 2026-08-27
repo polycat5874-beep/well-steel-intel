@@ -189,16 +189,45 @@ def _render_level_block(level, rows):
     return parts
 
 
-def build_daily_summary(items, watchlist, round_label):
+def build_system_alert(round_label, error):
+    """Dead-man's switch: tell the reader the WATCHER is broken.
+
+    From the reader's side a broken watcher and a quiet news day look identical -
+    that is exactly how this system stayed silent for 16 days in Aug 2026. Only
+    the daily-summary rounds send this (3x/day worst case); the realtime loop
+    runs ~36x/day and would burn the whole LINE quota in under a week.
+    """
+    return "\n".join([
+        "🚨 ระบบเฝ้าข่าวขัดข้อง — ยังไม่ได้เฝ้าข่าวให้",
+        f"🗓 {thai_date()}  |  รอบ{round_label}",
+        HEAVY_RULE,
+        "",
+        "ข้อความนี้แปลว่า ระบบพัง ไม่ใช่ ไม่มีข่าว",
+        "",
+        f"สาเหตุ: {str(error)[:300]}",
+        "",
+        "ตรวจ 3 จุดตามลำดับ:",
+        "1) Supabase ถูก pause หรือไม่ (free tier พักโปรเจคเมื่อไม่มี query 7 วัน)",
+        "2) GitHub Actions ถูกปิดจาก inactivity 60 วันหรือไม่",
+        "3) GitHub secret DATABASE_URL ยังตรงกับโปรเจคปัจจุบันหรือไม่",
+        HEAVY_RULE,
+    ])
+
+
+def build_daily_summary(items, watchlist, round_label, health=None):
     """Daily summary message (Thai), grouped RED/ORANGE/YELLOW -> topic + watchlist."""
     header = [
         f"📰 สรุปข่าวเหล็ก — รอบ{round_label}",
         f"🗓 {thai_date()}  |  ข่าวใหม่ {len(items)} ชิ้น",
         HEAVY_RULE,
     ]
+    # Proof-of-life appended to the footer: a digest saying "no news" then
+    # also proves the watcher ran, at no extra push cost.
+    footer = [f"🩺 {health}"] if health else []
     if not items:
         body = ["", "ไม่มีข่าวใหม่ที่เกี่ยวข้องในรอบนี้", "", LIGHT_RULE, ""]
-        return "\n".join(header + body + [build_watchlist_block(watchlist), HEAVY_RULE])
+        return "\n".join(header + body + [build_watchlist_block(watchlist)]
+                         + footer + [HEAVY_RULE])
 
     groups = {"RED": [], "ORANGE": [], "YELLOW": []}
     for it in items:
@@ -222,6 +251,7 @@ def build_daily_summary(items, watchlist, round_label):
     if ai_text:
         parts += ["", LIGHT_RULE, "🤖 บทวิเคราะห์ AI:", ai_text]
 
+    parts += footer
     parts.append(HEAVY_RULE)
     return "\n".join(parts)
 

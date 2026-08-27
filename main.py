@@ -197,28 +197,49 @@ def realtime_job(matcher_obj):
 
 
 def daily_summary_job(matcher_obj, round_label):
-    """07:00/12:00/18:00 rounds: summarize items stored since last round."""
+    """07:00/12:00/18:00 rounds: summarize items stored since last round.
+
+    This job doubles as the DEAD-MAN'S SWITCH. If collecting or the database
+    fails, it says so on LINE instead of going quiet: from the reader's side
+    silence is indistinguishable from "no news today", and that is precisely
+    how a 16-day outage in Aug 2026 went unnoticed. Only these rounds report
+    failures (<=3 pushes/day); the realtime loop stays silent because it runs
+    ~36x/day and would exhaust the LINE quota within a week of any outage.
+    """
     log.info("=== daily summary job (%s) ===", round_label)
+    stats, collect_error = None, None
     try:
-        collect_cycle(matcher_obj)  # fresh data right before summarizing
+        stats = collect_cycle(matcher_obj)  # fresh data right before summarizing
     except Exception as exc:
+        collect_error = exc
         log.error("collect before summary failed: %s", exc)
 
-    con = storage.connect()
+    con = None
     try:
+        con = storage.connect()
         fallback = (datetime.now() - timedelta(hours=24)).isoformat(timespec="seconds")
         since = storage.get_meta(con, "last_summary_at", fallback)
         items = storage.get_since(con, since)
+        if collect_error:
+            health = f"เก็บข่าวรอบนี้ล้มเหลว: {str(collect_error)[:120]}"
+        else:
+            health = f"ระบบปกติ · รอบนี้ตรวจข่าว {stats[0]:,} ชิ้น"
         msg = summarizer.build_daily_summary(
-            items, matcher_obj.cfg["watchlist"], round_label
+            items, matcher_obj.cfg["watchlist"], round_label, health=health
         )
         notifier.send(msg)
         storage.set_meta(
             con, "last_summary_at", datetime.now().isoformat(timespec="seconds")
         )
         log.info("daily summary sent (%d items)", len(items))
+    except Exception as exc:
+        # The watcher itself is down (DB paused/unreachable, schema gone...).
+        # Report it rather than letting the outage look like a quiet news day.
+        log.error("daily summary failed: %s", exc)
+        notifier.send(summarizer.build_system_alert(round_label, exc))
     finally:
-        con.close()
+        if con is not None:
+            con.close()
 
 
 def run_scheduler(matcher_obj):
