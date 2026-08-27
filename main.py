@@ -178,6 +178,31 @@ def realtime_job(matcher_obj):
                      len(pending))
             return
 
+        # Age gate. get_unalerted_critical selects on alerted=0 with no notion of
+        # time, so ANY widening of the alert rule instantly makes the whole
+        # never-alerted backlog eligible at once. That is not hypothetical: on
+        # 2026-08-27 admitting priority YELLOW items fired 109 alerts about news
+        # from June-August. An instant alert is for BREAKING news, so anything
+        # past the lookback window is aged out here - marked known, never sent.
+        lookback_hours = matcher_obj.settings.get("lookback_hours", 24)
+        keep_if_unknown = not matcher_obj.settings.get("drop_if_no_date", False)
+        fresh, stale_ids = [], []
+        for row in pending:
+            if is_fresh(row.get("published_datetime", ""),
+                        lookback_hours=lookback_hours,
+                        keep_if_unknown=keep_if_unknown):
+                fresh.append(row)
+            else:
+                stale_ids.append(row["id"])
+        if stale_ids:
+            storage.mark_alerted(con, stale_ids)
+            log.info("aged out %d critical items (older than %dh, never alerted)",
+                     len(stale_ids), lookback_hours)
+        pending = fresh
+        if not pending:
+            log.info("no fresh critical news pending alert")
+            return
+
         cap = matcher_obj.settings.get("alert_max_per_cycle", 8)
         sent_ids = []
         for row in pending[:cap]:
