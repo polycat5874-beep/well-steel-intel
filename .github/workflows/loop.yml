@@ -1,0 +1,71 @@
+name: steel-intel loop
+
+# WHY THIS EXISTS
+# GitHub's `schedule` trigger is best-effort and gets backed off hard after
+# repeated failures. Measured on this repo: the realtime cron held ~40min while
+# healthy, then stretched to 106 -> 116 -> 211 -> 335 -> 600+ minutes after the
+# paused Supabase produced ~10 consecutive failures. "Every 15 minutes" was
+# never true and had effectively stopped.
+#
+# `workflow_dispatch` is NOT throttled that way. So one run does ~5 hours of
+# real work using the app's own scheduler (realtime/15min + summaries at
+# 07:00/12:00/18:00 Asia/Bangkok, exactly as run_scheduler defines them) and
+# then dispatches its successor. The cron below is only the recovery path for
+# when that chain breaks; realtime.yml and summary.yml keep their schedules as
+# a second safety net - while this loop holds the shared concurrency group they
+# simply never start, and they only get a turn if the loop is dead.
+#
+# Runs entirely on GitHub's runners: nothing needs to be powered on locally.
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # recovery only - assume it fires far less often
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: write             # needed to dispatch the successor run
+
+concurrency:
+  group: steel-intel-run     # shared with realtime/summary: exactly one worker
+  cancel-in-progress: false
+
+jobs:
+  loop:
+    runs-on: ubuntu-latest
+    # Must stay above the internal 5h timeout: a job killed by timeout-minutes
+    # skips every remaining step, which would break the handoff chain.
+    timeout-minutes: 340
+    env:
+      TZ: Asia/Bangkok
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      LINE_CHANNEL_ID: ${{ secrets.LINE_CHANNEL_ID }}
+      LINE_CHANNEL_SECRET: ${{ secrets.LINE_CHANNEL_SECRET }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      - name: Run the scheduler for ~5 hours
+        run: |
+          start=$(date +%s)
+          # `timeout` returning 124 here is the expected path, not a failure.
+          timeout 18000 python main.py || true
+          echo "ELAPSED=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
+
+      - name: Hand off to the successor run
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Crash-loop guard: if the scheduler died early (bad config, missing
+          # secret) an immediate handoff would spin runs back to back forever.
+          elapsed="${ELAPSED:-0}"
+          if [ "$elapsed" -lt 600 ]; then
+            echo "scheduler exited after ${elapsed}s - padding before handoff"
+            sleep $(( 600 - elapsed ))
+          fi
+          gh workflow run loop.yml --repo "$GITHUB_REPOSITORY"
