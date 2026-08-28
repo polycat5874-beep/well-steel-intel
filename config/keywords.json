@@ -148,31 +148,8 @@
     }
   },
   "company_profile": {
-    "_comment": "[redacted]",
+    "_note": "โปรไฟล์กลางของอุตสาหกรรมเหล็กเส้น — ไม่ระบุตัวผู้ใช้งาน โปรไฟล์จริงถูกโหลดทับจาก STEEL_INTEL_PROFILE_JSON หรือ config/profile.json (ดู src/matcher.py: load_profile_overlay) repo นี้เป็น public จึงห้ามใส่ชื่อบริษัท ที่ตั้งโรงงาน หรือสถานะใบอนุญาตลงไฟล์นี้",
     "boosts": [
-      {
-        "keywords": [
-          "เหล็กทรงยาว",
-          "เตาอาร์กไฟฟ้า",
-          "อาร์กไฟฟ้า",
-          "EAF",
-          "10 สมาคมเหล็ก",
-          "สมาคมเหล็กทรงยาว"
-        ],
-        "score": 4,
-        "note": "[redacted]"
-      },
-      {
-        "keywords": [
-          "ผู้ประกอบการเตาอินดักชั่น",
-          "ผู้ค้า IF",
-          "ผู้ผลิตเหล็ก IF",
-          "หลอมโลหะด้วยเตาอินดักชั่น",
-          "กลุ่มทุนเตา IF"
-        ],
-        "score": 3,
-        "note": "[redacted]"
-      },
       {
         "keywords": [
           "เตา IF",
@@ -183,7 +160,30 @@
           "แบน IF"
         ],
         "score": 5,
-        "note": "[redacted]"
+        "note": "นโยบายจำกัดเตาเหนี่ยวนำ — กระทบสายผลิตของผู้ผลิตที่ใช้เตาชนิดนี้"
+      },
+      {
+        "keywords": [
+          "เหล็กทรงยาว",
+          "เตาอาร์กไฟฟ้า",
+          "อาร์กไฟฟ้า",
+          "EAF",
+          "10 สมาคมเหล็ก",
+          "สมาคมเหล็กทรงยาว"
+        ],
+        "score": 4,
+        "note": "ฝ่ายผลักดันให้ตัดเหล็กจากเตาเหนี่ยวนำออกจากมาตรฐานเคลื่อนไหว"
+      },
+      {
+        "keywords": [
+          "ผู้ประกอบการเตาอินดักชั่น",
+          "ผู้ค้า IF",
+          "ผู้ผลิตเหล็ก IF",
+          "หลอมโลหะด้วยเตาอินดักชั่น",
+          "กลุ่มทุนเตา IF"
+        ],
+        "score": 3,
+        "note": "ฝ่ายผู้ใช้เตาเหนี่ยวนำโต้กลับ/เคลื่อนไหว"
       },
       {
         "keywords": [
@@ -195,7 +195,7 @@
           "เหล็กเส้นกลม"
         ],
         "score": 4,
-        "note": "สินค้าหลักคือเหล็กเส้น มอก. 24/20 — กระทบสินค้าโดยตรง"
+        "note": "มาตรฐานบังคับของเหล็กเส้นก่อสร้างถูกแตะ"
       },
       {
         "keywords": [
@@ -203,7 +203,7 @@
           "Wire Rod"
         ],
         "score": 3,
-        "note": "เกาะติดต่ออายุ AD เหล็กลวดคาร์บอนสูงจีน ครบกำหนด พ.ค. 2026"
+        "note": "มาตรการตอบโต้การทุ่มตลาดเหล็กลวดคาร์บอนสูง"
       },
       {
         "keywords": [
@@ -212,7 +212,7 @@
           "สแครป"
         ],
         "score": 2,
-        "note": "วัตถุดิบหลัก 90% คือเศษเหล็กในประเทศ — กระทบต้นทุนวัตถุดิบ"
+        "note": "ต้นทุนวัตถุดิบหลักของโรงหลอม"
       },
       {
         "keywords": [
@@ -221,17 +221,7 @@
           "หลบเลี่ยง AD"
         ],
         "score": 2,
-        "note": "เฝ้าการหลบเลี่ยง AD เหล็ก HRC จากจีน"
-      },
-      {
-        "keywords": [
-          "[redacted]",
-          "[redacted]",
-          "[redacted]",
-          "[redacted]"
-        ],
-        "score": 2,
-        "note": "[redacted]"
+        "note": "การหลบเลี่ยงมาตรการตอบโต้การทุ่มตลาดเหล็กแผ่นรีดร้อน"
       }
     ]
   },
@@ -262,7 +252,7 @@
         "ยกเลิก IF",
         "เหล็กเส้น"
       ],
-      "note": "[redacted]"
+      "note": "เฝ้าสถานะร่าง/ประกาศราชกิจจาฯ"
     },
     {
       "id": "hrc_circumvention",
@@ -288,7 +278,7 @@
         "กมอ.",
         "มอก."
       ],
-      "note": "[redacted]"
+      "note": "ผลของศึกนี้ชี้ว่าเหล็กเส้นจากเตาเหนี่ยวนำจะยังผลิตได้หรือไม่"
     }
   ],
   "settings": {
@@ -310,14 +300,14 @@
     "_lookback_note": "Freshness window: an article whose actual publication time is older than this many hours is ignored (never stored/alerted), regardless of dedup state. Comparison is timezone-aware in Asia/Bangkok.",
     "drop_if_no_date": false,
     "_drop_if_no_date_note": "When an item has NO parseable published date (e.g. gov listing links): false = keep it (conservative, preserves gov signal), true = drop it (strict).",
-      "cluster_enabled": true,
-      "cluster_jaccard_min": 0.62,
-      "cluster_ratio_min": 0.7,
-      "cluster_len_ratio_min": 0.5,
-      "cluster_window_hours": 36,
-      "cluster_max_rows": 600,
-      "cluster_ngram": 3,
-      "_cluster_note": "Same-story collapse at DISPLAY time only (src/cluster.py): rows are never merged or deleted in the database, they are only grouped when a card or a digest is built, and every outlet in a group is still named on the card. cluster_jaccard_min is the character-3-gram overlap two headlines need to count as one story. 0.62 was chosen from real headlines in this DB: one story re-worded by another desk measures 0.62-1.00, while the dangerous near-miss pair (different events, same actors, same vocabulary) 'ผู้ผลิตเตา IF ค้านแนวคิด กมอ.' vs 'สมาคมเหล็ก IF โวย มติ กมอ.' measures 0.15 - so 0.62 sits in the middle of the empty band, not on the edge of either group. Lower it to 0.55 to merge more aggressively, but ALWAYS run `python main.py --cluster-report` first and read every group it prints: a wrong merge hides real news. cluster_ratio_min is difflib's order-aware second opinion, cluster_len_ratio_min stops a short headline being swallowed by a long one, cluster_window_hours refuses to merge the same headline published days apart (that is a re-run, i.e. new news), cluster_max_rows disables collapsing on an unexpectedly huge batch (grouping is O(rows x groups)), and cluster_enabled=false restores the previous behaviour exactly.",
+    "cluster_enabled": true,
+    "cluster_jaccard_min": 0.62,
+    "cluster_ratio_min": 0.7,
+    "cluster_len_ratio_min": 0.5,
+    "cluster_window_hours": 36,
+    "cluster_max_rows": 600,
+    "cluster_ngram": 3,
+    "_cluster_note": "Same-story collapse at DISPLAY time only (src/cluster.py): rows are never merged or deleted in the database, they are only grouped when a card or a digest is built, and every outlet in a group is still named on the card. cluster_jaccard_min is the character-3-gram overlap two headlines need to count as one story. 0.62 was chosen from real headlines in this DB: one story re-worded by another desk measures 0.62-1.00, while the dangerous near-miss pair (different events, same actors, same vocabulary) 'ผู้ผลิตเตา IF ค้านแนวคิด กมอ.' vs 'สมาคมเหล็ก IF โวย มติ กมอ.' measures 0.15 - so 0.62 sits in the middle of the empty band, not on the edge of either group. Lower it to 0.55 to merge more aggressively, but ALWAYS run `python main.py --cluster-report` first and read every group it prints: a wrong merge hides real news. cluster_ratio_min is difflib's order-aware second opinion, cluster_len_ratio_min stops a short headline being swallowed by a long one, cluster_window_hours refuses to merge the same headline published days apart (that is a re-run, i.e. new news), cluster_max_rows disables collapsing on an unexpectedly huge batch (grouping is O(rows x groups)), and cluster_enabled=false restores the previous behaviour exactly.",
     "priority_alert_keywords": [
       "มอก.",
       "สมอ.",

@@ -24,6 +24,10 @@ jobs:
       LINE_CHANNEL_ID: ${{ secrets.LINE_CHANNEL_ID }}
       LINE_CHANNEL_SECRET: ${{ secrets.LINE_CHANNEL_SECRET }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      # Risk profile lives in a secret, not in this public repo.
+      STEEL_INTEL_PROFILE_JSON: ${{ secrets.STEEL_INTEL_PROFILE_JSON }}
+      # Empty = broadcast to every OA follower; set = push to one recipient.
+      LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

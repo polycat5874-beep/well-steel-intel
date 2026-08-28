@@ -4,3 +4,7 @@ news.db
 logs/
 __pycache__/
 *.pyc
+
+# Operator risk profile - names the company, plant and licences. Never commit:
+# this repo is public so that GitHub Actions minutes stay free.
+config/profile.json
