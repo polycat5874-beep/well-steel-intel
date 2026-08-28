@@ -9,9 +9,12 @@ Channel selection (in order):
   2. Telegram  if TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID are set
   3. DRY-RUN   otherwise -> message printed to console/log (used for tests)
 
-Note on LINE free-tier quota (~500 push messages/month): to economise, a long
-message is split into chunks and packed into a SINGLE push request (LINE allows
-up to 5 message objects per request), so one alert = one push whenever possible.
+Note on the LINE free-tier quota: LINE bills (number of API requests) x (number
+of recipients), NOT the number of message objects. One request may carry up to 5
+text objects of ~4,900 chars each (~24,500 chars) at the SAME cost as a one-line
+message. Everything here is therefore packed into as few requests as possible:
+a long text is chunked (`_chunk`) and whole alert cards are packed with
+`plan_requests`, so a whole batch of alerts costs ONE push.
 """
 import logging
 import os
@@ -27,6 +30,9 @@ LINE_BROADCAST_URL = "https://api.line.me/v2/bot/message/broadcast"
 LINE_TOKEN_URL = "https://api.line.me/v2/oauth/accessToken"
 LINE_TEXT_LIMIT = 4900      # LINE hard limit is 5000 chars per text object
 LINE_MAX_OBJECTS = 5        # LINE allows up to 5 message objects per push request
+LINE_QUOTA_URL = "https://api.line.me/v2/bot/message/quota"
+LINE_CONSUMPTION_URL = "https://api.line.me/v2/bot/message/quota/consumption"
+BLOCK_SEP = "\n\n"   # joiner between two whole cards packed into one text object
 
 _token_cache = {"token": None}  # in-process cache for an auto-issued token
 
@@ -56,6 +62,70 @@ def _chunk(text, limit):
     if buf:
         out.append(buf)
     return out
+
+
+def plan_requests(blocks, limit=LINE_TEXT_LIMIT, max_objects=LINE_MAX_OBJECTS):
+    """Pack whole message BLOCKS into as few LINE requests as possible.
+
+    LINE charges a push by (requests x recipients), not by message objects, so
+    one request carrying 5 text objects of 4,900 chars (~24,500 chars) costs the
+    SAME as one request carrying a single short line. Sending N alerts as N
+    requests - which this system used to do - burns N times the quota for no
+    reason.
+
+    `blocks` is a list of self-contained strings (one alert card, a header, a
+    footer). They are concatenated with BLOCK_SEP while they fit inside one text
+    object; a block is NEVER cut in the middle unless it alone exceeds `limit`
+    (then, and only then, it is hard-split by _chunk as a last resort).
+
+    Returns a list of {"objects": [str, ...], "blocks": [int, ...]} - the text
+    objects of one request and the indices of the source blocks it carries.
+    """
+    plan = []
+    cur_objects, cur_blocks = [], []
+    buf, buf_blocks = "", []
+
+    def close_request():
+        if cur_objects:
+            seen, ordered = set(), []
+            for i in cur_blocks:
+                if i not in seen:
+                    seen.add(i)
+                    ordered.append(i)
+            plan.append({"objects": list(cur_objects), "blocks": ordered})
+        cur_objects.clear()
+        cur_blocks.clear()
+
+    def add_object(text, idxs):
+        if len(cur_objects) >= max_objects:
+            close_request()
+        cur_objects.append(text)
+        cur_blocks.extend(idxs)
+
+    def flush_buf():
+        nonlocal buf, buf_blocks
+        if buf_blocks:
+            add_object(buf, buf_blocks)
+        buf, buf_blocks = "", []
+
+    for idx, block in enumerate(blocks):
+        block = block if block is not None else ""
+        if len(block) > limit:
+            # Pathological single block: cannot be kept whole, split it.
+            flush_buf()
+            log.warning("oversized alert block hard-split (%d chars)", len(block))
+            for piece in _chunk(block, limit):
+                add_object(piece, [idx])
+            continue
+        candidate = f"{buf}{BLOCK_SEP}{block}" if buf_blocks else block
+        if len(candidate) <= limit:
+            buf, buf_blocks = candidate, buf_blocks + [idx]
+        else:
+            flush_buf()
+            buf, buf_blocks = block, [idx]
+    flush_buf()
+    close_request()
+    return plan
 
 
 def _line_configured():
@@ -144,47 +214,74 @@ def _line_post(url, payload, token):
         return False, False
 
 
-def _send_line(text):
-    """Send to LINE. If LINE_USER_ID is set -> push to that user; otherwise
-    -> broadcast to all friends of the Official Account. Chunks are packed into
-    as few requests as possible (<=5 objects each) to conserve push quota. If the
-    token is rejected (expired), it is re-minted from id+secret and retried once."""
+def _send_line_requests(requests_objects):
+    """Send pre-planned LINE requests. `requests_objects` is a list of requests,
+    each a list of <=5 text-object strings.
+
+    Returns (ok, n_requests) where n_requests is what LINE actually BILLED. A
+    401 retry does not count twice: the rejected attempt never reached the
+    recipients, so LINE does not charge it.
+    """
+    if not requests_objects:
+        return True, 0
     token = _line_token()
     if not token:
         log.warning("no LINE token available")
-        return False
+        return False, 0
 
     user_id = os.getenv("LINE_USER_ID")
     url = LINE_PUSH_URL if user_id else LINE_BROADCAST_URL
     mode = "push" if user_id else "broadcast"
     log.info("LINE send mode: %s", mode)
 
-    chunks = _chunk(text, LINE_TEXT_LIMIT)
-    ok = True
-    for i in range(0, len(chunks), LINE_MAX_OBJECTS):
-        batch = chunks[i:i + LINE_MAX_OBJECTS]
-        messages = [{"type": "text", "text": c} for c in batch]
+    ok, used = True, 0
+    for objects in requests_objects:
+        messages = [{"type": "text", "text": c} for c in objects]
         payload = {"to": user_id, "messages": messages} if user_id else {"messages": messages}
         sent, unauthorized = _line_post(url, payload, token)
         if unauthorized:  # token expired -> mint a fresh one and retry this batch
             token = _line_token(force_refresh=True)
             sent, _ = _line_post(url, payload, token) if token else (False, False)
+        used += 1
         ok = sent and ok
-    return ok
+    return ok, used
+
+
+def _line_plan_for_text(text):
+    """Chunk one long text into requests of <=5 objects (legacy packing)."""
+    chunks = _chunk(text, LINE_TEXT_LIMIT)
+    return [chunks[i:i + LINE_MAX_OBJECTS]
+            for i in range(0, len(chunks), LINE_MAX_OBJECTS)]
+
+
+def _send_line(text):
+    """Send to LINE. If LINE_USER_ID is set -> push to that user; otherwise
+    -> broadcast to all friends of the Official Account. Chunks are packed into
+    as few requests as possible (<=5 objects each) to conserve push quota. If the
+    token is rejected (expired), it is re-minted from id+secret and retried once.
+    Returns (ok, n_requests)."""
+    return _send_line_requests(_line_plan_for_text(text))
+
+
+def _telegram_post(text):
+    """One Telegram message. Returns True on success."""
+    return _post_with_retry(
+        TELEGRAM_URL.format(token=os.getenv("TELEGRAM_BOT_TOKEN")),
+        headers={},
+        data={"chat_id": os.getenv("TELEGRAM_CHAT_ID"), "text": text,
+              "disable_web_page_preview": True},
+        label="telegram",
+    )
 
 
 def _send_telegram(text):
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    ok = True
+    """Returns (ok, n_requests). Telegram has no push quota, so one message per
+    chunk is fine."""
+    ok, used = True, 0
     for chunk in _chunk(text, TELEGRAM_LIMIT):
-        ok = _post_with_retry(
-            TELEGRAM_URL.format(token=token),
-            headers={},
-            data={"chat_id": chat_id, "text": chunk, "disable_web_page_preview": True},
-            label="telegram",
-        ) and ok
-    return ok
+        ok = _telegram_post(chunk) and ok
+        used += 1
+    return ok, used
 
 
 def _dry_run(text):
@@ -195,12 +292,98 @@ def _dry_run(text):
     return False
 
 
-def send(text):
-    """Send a notification through the active channel. Returns True if delivered,
-    False on dry-run or delivery failure (failures are logged, never raised)."""
+def send_counted(text):
+    """Same as send(), but also reports how many API requests it cost.
+
+    Returns (ok, n_requests). The count is what the quota bookkeeping records;
+    on dry-run it is the number of requests the message WOULD have cost, so
+    local runs still exercise the budget logic."""
     channel = active_channel()
     if channel == "line":
         return _send_line(text)
     if channel == "telegram":
         return _send_telegram(text)
-    return _dry_run(text)
+    return _dry_run(text), len(_line_plan_for_text(text))
+
+
+def send(text):
+    """Send a notification through the active channel. Returns True if delivered,
+    False on dry-run or delivery failure (failures are logged, never raised)."""
+    return send_counted(text)[0]
+
+
+def send_blocks(blocks, max_requests=None):
+    """Send whole message blocks packed into as few requests as possible.
+
+    `max_requests` caps how many requests this call may spend; anything that
+    does not fit is simply NOT sent (the caller re-offers it next cycle).
+
+    Returns (ok, requests_used, covered) where `covered` is the set of block
+    indices that were actually delivered in full. A block that got split across
+    the boundary between a sent and a dropped request is NOT considered covered
+    - the caller must not mark it as done.
+    """
+    if not blocks:
+        return True, 0, set()
+
+    plan = plan_requests(blocks)
+    taken = plan if max_requests is None else plan[:max_requests]
+    dropped = [] if max_requests is None else plan[max_requests:]
+    sent_idx, dropped_idx = set(), set()
+    for req in taken:
+        sent_idx |= set(req["blocks"])
+    for req in dropped:
+        dropped_idx |= set(req["blocks"])
+    covered = sent_idx - dropped_idx
+
+    channel = active_channel()
+    if channel == "line":
+        ok, used = _send_line_requests([r["objects"] for r in taken])
+        return ok, used, covered
+    if channel == "telegram":
+        ok, used = True, 0
+        for req in taken:
+            for obj in req["objects"]:
+                for chunk in _chunk(obj, TELEGRAM_LIMIT):
+                    ok = _telegram_post(chunk) and ok
+                    used += 1
+        return ok, used, covered
+    for req in taken:
+        for obj in req["objects"]:
+            _dry_run(obj)
+    return False, len(taken), covered
+
+
+def line_quota_status():
+    """Read the LINE monthly push allowance and how much of it is already used.
+
+    Returns (limit, used) as ints, or (None, None) when unavailable. These are
+    GET endpoints: reading them does NOT consume quota.
+    """
+    if active_channel() != "line":
+        return None, None
+    token = _line_token()
+    if not token:
+        return None, None
+
+    def _get(url, tok):
+        return requests.get(url, headers={"Authorization": f"Bearer {tok}"}, timeout=15)
+
+    try:
+        resp = _get(LINE_QUOTA_URL, token)
+        if resp.status_code == 401:  # expired token -> re-mint once
+            token = _line_token(force_refresh=True)
+            if not token:
+                return None, None
+            resp = _get(LINE_QUOTA_URL, token)
+        resp.raise_for_status()
+        limit = resp.json().get("value")
+        resp2 = _get(LINE_CONSUMPTION_URL, token)
+        resp2.raise_for_status()
+        used = resp2.json().get("totalUsage")
+        limit = int(limit) if limit is not None else None
+        used = int(used) if used is not None else None
+        return limit, used
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        log.warning("cannot read LINE quota: %s", exc)
+        return None, None

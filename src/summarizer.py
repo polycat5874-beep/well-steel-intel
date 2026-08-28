@@ -87,12 +87,18 @@ def _src(item):
 
 # --- critical alert ------------------------------------------------------
 
-def build_critical_alert(item, analysis):
+def build_critical_alert(item, analysis, index=None, total=None):
     """Premium realtime alert card (Thai) for one news item. `item` and
-    `analysis` may be the same dict (a DB row already carries both)."""
+    `analysis` may be the same dict (a DB row already carries both).
+
+    `index`/`total` number the card inside a batch ("2/8") so a reader can tell
+    at a glance that several cards arrived in ONE push. Both omitted -> the
+    output is byte-for-byte the original single-card layout."""
     emoji = LEVEL_EMOJI.get(analysis.get("level"), "⚪")
+    header = ("🚨 [CRITICAL ALERT]" if index is None or total is None
+              else f"🚨 [CRITICAL ALERT {index}/{total}]")
     lines = [
-        "🚨 [CRITICAL ALERT]",
+        header,
         item.get("title", "").strip(),
         "",
         HEAVY_RULE,
@@ -123,6 +129,44 @@ def build_critical_alert(item, analysis):
         lines += ["", "🔗 ลิงก์ข่าว", f"   {item['url']}"]
     lines.append(HEAVY_RULE)
     return "\n".join(lines)
+
+
+def build_alert_batch_header(n_total, n_detailed):
+    """Opening block of a batched realtime alert.
+
+    All the cards of one cycle travel in a SINGLE LINE request (see
+    notifier.plan_requests), so the reader needs to know up front how many
+    stories this push carries."""
+    lines = [
+        f"🚨 แจ้งเตือนด่วน — ข่าวสำคัญ {n_total} ชิ้น",
+        f"🗓 {thai_date()}",
+    ]
+    if n_detailed < n_total:
+        lines.append(f"(กางรายละเอียด {n_detailed} ชิ้นแรก · ที่เหลือแสดงเฉพาะพาดหัว)")
+    lines.append(HEAVY_RULE)
+    return "\n".join(lines)
+
+
+def build_extra_headlines(rows, limit=20):
+    """Headline-only tail block for items beyond alert_max_per_cycle."""
+    if not rows:
+        return ""
+    lines = [f"🚨 ข่าวสำคัญเพิ่มเติมอีก {len(rows)} ชิ้นในรอบนี้:"]
+    lines += [f"• {r['title']}" for r in rows[:limit]]
+    return "\n".join(lines)
+
+
+def build_quota_warning(status):
+    """Short Thai notice appended to a digest when the monthly LINE quota is
+    running out. Appended to an existing message - never pushed on its own,
+    because the warning itself would consume the quota it is warning about."""
+    return "\n".join([
+        f"⚠️ โควต้า LINE เดือน {status['month']} ใช้ไปแล้ว "
+        f"{status['used']}/{status['limit']} ข้อความ "
+        f"({status['ratio'] * 100:.0f}%) เหลือ {status['left']} ข้อความ",
+        "   ระบบจะจำกัดการแจ้งเตือนด่วนอัตโนมัติ (เก็บโควต้าไว้ให้สรุป 3 รอบ/วัน)",
+        "   ถ้าต้องการเตือนครบทุกชิ้น ให้เพิ่มแพ็กเกจ LINE หรือลดจำนวนผู้รับ",
+    ])
 
 
 # --- daily summary -------------------------------------------------------

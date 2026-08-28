@@ -9,6 +9,8 @@ CLI:
   python main.py            run the scheduler (production mode)
   python main.py --once     run one fetch+alert cycle then exit (smoke test)
   python main.py --summary  force a daily summary now then exit
+  python main.py --quota    print the LINE push-quota status (sends nothing)
+  python main.py --quota-set-month N   backfill this month's request counter
 """
 import argparse
 import json
@@ -21,7 +23,7 @@ from datetime import datetime, timedelta
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
-from src import storage, notifier, summarizer  # noqa: E402
+from src import storage, notifier, summarizer, quota  # noqa: E402
 from src.matcher import Matcher  # noqa: E402
 from src.sources import google_news, rss_feeds, gov_sites  # noqa: E402
 from src.sources.base import (  # noqa: E402
@@ -203,20 +205,53 @@ def realtime_job(matcher_obj):
             log.info("no fresh critical news pending alert")
             return
 
+        # Push budget. LINE bills per REQUEST x recipients, and this loop used
+        # to fire one request per news item - 8 alerts = 8 pushes, which on
+        # 2026-08-27 ate a fifth of the monthly quota in a single cycle. Now the
+        # whole batch is packed into ONE request (max_requests=1), and even that
+        # one request is only spent while the daily/monthly budget allows.
         cap = matcher_obj.settings.get("alert_max_per_cycle", 8)
-        sent_ids = []
-        for row in pending[:cap]:
-            msg = summarizer.build_critical_alert(row, row)
-            notifier.send(msg)
-            sent_ids.append(row["id"])
-        overflow = pending[cap:]
+        override_levels = matcher_obj.settings.get("alert_override_levels", ["RED"])
+        budget_left = quota.realtime_budget_left(con, matcher_obj.settings)
+        is_override = False
+        if budget_left <= 0:
+            # Out of budget: only a genuinely top-level story may still buy an
+            # emergency push, and only while the override reserve holds.
+            top = [r for r in pending if r.get("level") in override_levels]
+            if not top or quota.override_left(con, matcher_obj.settings) <= 0:
+                # Deliberately NOT marking anything alerted: these items stay
+                # pending and are re-offered next cycle / in the daily digest.
+                log.info("push budget spent: deferring %d critical items", len(pending))
+                return
+            pending = top
+            is_override = True
+            log.warning("push budget spent; spending override push on %d %s items",
+                        len(top), "/".join(override_levels))
+
+        # Build self-contained blocks + the row ids each one accounts for, so
+        # only what actually went out gets marked alerted.
+        detailed, overflow = pending[:cap], pending[cap:]
+        blocks = [summarizer.build_alert_batch_header(len(pending), len(detailed))]
+        block_rows = [[]]
+        for i, row in enumerate(detailed, 1):
+            blocks.append(summarizer.build_critical_alert(
+                row, row, index=i, total=len(detailed)))
+            block_rows.append([row["id"]])
         if overflow:
-            lines = [f"🚨 ข่าวสำคัญเพิ่มเติมอีก {len(overflow)} ชิ้นในรอบนี้:"]
-            lines += [f"• {r['title']}" for r in overflow[:20]]
-            notifier.send("\n".join(lines))
-            sent_ids += [r["id"] for r in overflow]
+            blocks.append(summarizer.build_extra_headlines(overflow))
+            block_rows.append([r["id"] for r in overflow])
+
+        ok, used, covered = notifier.send_blocks(blocks, max_requests=1)
+        # mark_alerted follows `covered`, NEVER `ok`: on dry-run (no credentials)
+        # ok is always False, and gating on it would re-send the same news every
+        # cycle forever. `covered` says what was actually put on the wire.
+        sent_ids = [i for idx in sorted(covered) for i in block_rows[idx]]
         storage.mark_alerted(con, sent_ids)
-        log.info("alerted %d critical items", len(sent_ids))
+        quota.record(con, used, kind="realtime", override=is_override)
+        if not ok and used and notifier.active_channel() == "line":
+            log.warning("LINE reported a delivery failure for this alert batch")
+        log.info("alerted %d critical items in %d LINE request(s); deferred %d",
+                 len(sent_ids), used, len(pending) - len(sent_ids))
     finally:
         con.close()
 
@@ -249,22 +284,66 @@ def daily_summary_job(matcher_obj, round_label):
             health = f"เก็บข่าวรอบนี้ล้มเหลว: {str(collect_error)[:120]}"
         else:
             health = f"ระบบปกติ · รอบนี้ตรวจข่าว {stats[0]:,} ชิ้น"
+        # Quota warning rides ALONG WITH this digest (never as its own push -
+        # that would burn the very quota it is warning about). The LINE GET
+        # endpoints are authoritative and cost nothing.
+        # Isolated: this is a nice-to-have, and a hiccup reading it must never
+        # make a perfectly healthy digest trip the dead-man's switch.
+        warn = None
+        try:
+            line_limit, line_used = notifier.line_quota_status()
+            warn = quota.pending_month_warning(
+                con, matcher_obj.settings, line_used=line_used, line_limit=line_limit)
+            if warn:
+                health = health + "\n" + summarizer.build_quota_warning(warn)
+        except Exception as exc:
+            log.warning("quota warning check skipped: %s", exc)
         msg = summarizer.build_daily_summary(
             items, matcher_obj.cfg["watchlist"], round_label, health=health
         )
-        notifier.send(msg)
+        ok, used = notifier.send_counted(msg)
+        quota.record(con, used, kind="summary")
+        if used > 1:
+            log.warning("digest cost %d LINE requests - consider lowering "
+                        "LEVEL_SHOW_CAP['RED']", used)
+        if warn and ok:
+            quota.mark_month_warned(con)
         storage.set_meta(
             con, "last_summary_at", datetime.now().isoformat(timespec="seconds")
         )
-        log.info("daily summary sent (%d items)", len(items))
+        log.info("daily summary sent (%d items, %d LINE request(s))", len(items), used)
     except Exception as exc:
         # The watcher itself is down (DB paused/unreachable, schema gone...).
         # Report it rather than letting the outage look like a quiet news day.
         log.error("daily summary failed: %s", exc)
-        notifier.send(summarizer.build_system_alert(round_label, exc))
+        ok, used = notifier.send_counted(summarizer.build_system_alert(round_label, exc))
+        # Book it only if we still have a connection - and never let bookkeeping
+        # throw over the top of the dead-man's switch.
+        if con is not None:
+            try:
+                quota.record(con, used, kind="summary")
+            except Exception as qexc:  # pragma: no cover - record() never raises
+                log.warning("cannot record quota for system alert: %s", qexc)
     finally:
         if con is not None:
             con.close()
+
+
+def quota_cli(matcher_obj, set_month=None):
+    """--quota / --quota-set-month: read-only report (optionally after a manual
+    backfill). Reading the LINE quota uses GET endpoints and sends nothing."""
+    con = storage.connect()
+    try:
+        if set_month is not None:
+            quota.set_month_requests(con, set_month)
+            print(f"ตั้งตัวนับ request ของเดือน {quota.month_key()[-7:]} = {set_month}")
+        line_limit, line_used = notifier.line_quota_status()
+        if line_used is None:
+            print("(อ่านโควต้าจาก LINE API ไม่ได้ — ใช้ตัวนับในฐานข้อมูลแทน)")
+        print(quota.report(con, matcher_obj.settings,
+                           line_used=line_used, line_limit=line_limit))
+    finally:
+        con.close()
 
 
 def run_scheduler(matcher_obj):
@@ -292,13 +371,19 @@ def main():
     parser = argparse.ArgumentParser(description="steel-intel news monitor")
     parser.add_argument("--once", action="store_true", help="one fetch+alert cycle")
     parser.add_argument("--summary", action="store_true", help="force summary now")
+    parser.add_argument("--quota", action="store_true",
+                        help="print LINE push-quota status (sends nothing)")
+    parser.add_argument("--quota-set-month", type=int, metavar="N",
+                        help="backfill this month's request counter to N")
     args = parser.parse_args()
 
     load_env()
     setup_logging()
     matcher_obj = Matcher()
 
-    if args.once:
+    if args.quota or args.quota_set_month is not None:
+        quota_cli(matcher_obj, args.quota_set_month)
+    elif args.once:
         realtime_job(matcher_obj)
     elif args.summary:
         hour = datetime.now().hour

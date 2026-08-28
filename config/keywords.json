@@ -293,6 +293,16 @@
   ],
   "settings": {
     "alert_max_per_cycle": 8,
+    "alert_push_budget_per_day": 2,
+    "alert_override_levels": [
+      "RED"
+    ],
+    "alert_override_max_per_day": 1,
+    "line_monthly_quota": 300,
+    "line_recipients": 2,
+    "summary_reserve_per_day": 3,
+    "quota_warn_ratio": 0.7,
+    "_push_budget_note": "LINE bills (requests x recipients), NOT message objects: one request carries up to 5 text objects of ~4,900 chars for the price of one. Arithmetic: line_monthly_quota/line_recipients = 300/2 = 150 requests per month; summary_reserve_per_day (3 digests) x 31 days = 93 reserved, leaving ~57 requests/month for realtime alerts (~2/day = alert_push_budget_per_day). A whole cycle of alerts is packed into ONE request, so this budget is per CYCLE, not per news item. When the daily budget is spent, only alert_override_levels items may still fire, at most alert_override_max_per_day extra requests; everything else waits for the next cycle or the daily digest (nothing is dropped). quota_warn_ratio: append a quota warning to the digest once the month passes this fraction of the plan.",
     "score_red": 10,
     "score_orange": 5,
     "score_yellow": 2,
