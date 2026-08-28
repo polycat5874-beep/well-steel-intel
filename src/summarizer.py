@@ -15,6 +15,7 @@ import logging
 import os
 from datetime import date, datetime
 
+from src.cluster import normalize_title
 from src.sources.base import split_sentences
 
 log = logging.getLogger("steel_intel.summarizer")
@@ -85,6 +86,35 @@ def _src(item):
     return item.get("source_name") or item.get("source") or "-"
 
 
+def _also_reported_lines(item, indent="   ", max_title=70):
+    """Thai block listing the other outlets that carried the SAME story.
+
+    THE NO-HIDING RULE. Clustering (cluster.py) merges rows that look like one
+    story, and its worst failure mode is a wrong merge that makes real news
+    disappear without a trace. So this block always names EVERY outlet in the
+    group, and additionally prints that outlet's own headline whenever the
+    headline differs (after normalisation) from the leader's. A bad merge then
+    shows up as two visibly different headlines inside one card instead of a
+    silently missing story.
+
+    Returns [] when the item carries no merged members, so a plain dict (e.g.
+    from test_alert.py) renders exactly as it always did."""
+    others = item.get("also_reported") or []
+    if not others:
+        return []
+    lines = [f"📰 อีก {len(others)} สำนักรายงานเรื่องเดียวกัน"]
+    leader_norm = normalize_title(item.get("title"))
+    for other in others:
+        name = _src(other)
+        title = (other.get("title") or "").strip()
+        if title and normalize_title(title) != leader_norm:
+            shown = title if len(title) <= max_title else title[:max_title - 1] + "…"
+            lines.append(f"{indent}• {name} — {shown}")
+        else:
+            lines.append(f"{indent}• {name}")
+    return lines
+
+
 # --- critical alert ------------------------------------------------------
 
 def build_critical_alert(item, analysis, index=None, total=None):
@@ -108,8 +138,11 @@ def build_critical_alert(item, analysis, index=None, total=None):
         "🌐 แหล่งที่มา",
         f"   {_src(item)}",
         "",
-        "📝 สรุปเนื้อหาข่าว",
     ]
+    also = _also_reported_lines(item)
+    if also:                       # omitted entirely when nothing was merged,
+        lines += also + [""]       # so an un-clustered card is byte-identical
+    lines.append("📝 สรุปเนื้อหาข่าว")
     bullets = summary_bullets(item)
     if bullets:
         lines += [f"   • {b}" for b in bullets]
@@ -152,7 +185,12 @@ def build_extra_headlines(rows, limit=20):
     if not rows:
         return ""
     lines = [f"🚨 ข่าวสำคัญเพิ่มเติมอีก {len(rows)} ชิ้นในรอบนี้:"]
-    lines += [f"• {r['title']}" for r in rows[:limit]]
+    for r in rows[:limit]:
+        extra = r.get("also_reported") or []
+        # Even in the headline-only tail the reader is told the item stands for
+        # several outlets, so a collapsed group never looks like a single report.
+        suffix = f" (+{len(extra)} สำนัก)" if extra else ""
+        lines.append(f"• {r['title']}{suffix}")
     return "\n".join(lines)
 
 
@@ -219,6 +257,20 @@ def _render_level_block(level, rows):
                 meta_line += f"📅 {meta} · "
             meta_line += f"🌐 {src}"
             parts.append(meta_line)
+            # No-hiding rule (see _also_reported_lines): every outlet in the
+            # merged group is named, and any member whose headline differs from
+            # the leader's gets its headline printed too. Deliberately NOT
+            # capped - a truncated member list is exactly the silent loss this
+            # feature must not create.
+            others = it.get("also_reported") or []
+            if others:
+                parts.append(f"   📰 อีก {len(others)} สำนัก: "
+                             + ", ".join(_src(o) for o in others))
+                leader_norm = normalize_title(it.get("title"))
+                for other in others:
+                    other_title = (other.get("title") or "").strip()
+                    if other_title and normalize_title(other_title) != leader_norm:
+                        parts.append(f"   ↳ [{_src(other)}] {other_title}")
             for b in summary_bullets(it, max_points=1):
                 parts.append(f"   • {b}")
             for note in it.get("impact_notes", [])[:1]:
@@ -258,11 +310,20 @@ def build_system_alert(round_label, error):
     ])
 
 
-def build_daily_summary(items, watchlist, round_label, health=None):
-    """Daily summary message (Thai), grouped RED/ORANGE/YELLOW -> topic + watchlist."""
+def build_daily_summary(items, watchlist, round_label, health=None, n_rows=None):
+    """Daily summary message (Thai), grouped RED/ORANGE/YELLOW -> topic + watchlist.
+
+    `n_rows` is how many DATABASE ROWS the `items` stand for once same-story rows
+    have been merged (see cluster.group_stories). Left as None - or equal to
+    len(items) - the header keeps its original wording exactly; otherwise it
+    states both numbers, so a shrinking headline count reads as "merged", never
+    as "the watcher found less news"."""
+    count = f"ข่าวใหม่ {len(items)} ชิ้น"
+    if n_rows is not None and n_rows != len(items):
+        count = f"ข่าวใหม่ {len(items)} เรื่อง (จาก {n_rows} ชิ้น)"
     header = [
         f"📰 สรุปข่าวเหล็ก — รอบ{round_label}",
-        f"🗓 {thai_date()}  |  ข่าวใหม่ {len(items)} ชิ้น",
+        f"🗓 {thai_date()}  |  {count}",
         HEAVY_RULE,
     ]
     # Proof-of-life appended to the footer: a digest saying "no news" then

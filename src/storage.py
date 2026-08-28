@@ -15,6 +15,13 @@ Postgres wrapper below translates ``?`` -> ``%s`` and emulates the small slice o
 the sqlite3 connection API this module relies on, so callers never branch.
 
 Dedup key = sha256(url + title) per spec.
+
+`story_key` is a SECOND, weaker key: a hash of the normalised headline (see
+cluster.py). It never gates an insert - two outlets carrying one story are still
+two rows - it only lets a reader/report find same-story rows cheaply. Like every
+other late addition it is appended LAST everywhere (CREATE TABLE, _ADDED_COLUMNS,
+ROW_COLS, INSERT_COLS, _row_values) so a freshly created table and a migrated one
+zip against ROW_COLS identically.
 """
 import hashlib
 import json
@@ -23,6 +30,7 @@ import os
 import sqlite3
 from datetime import datetime
 
+from .cluster import story_key
 from .sources.base import canonicalize_url
 
 log = logging.getLogger("steel_intel.storage")
@@ -50,7 +58,8 @@ CREATE TABLE IF NOT EXISTS news (
     alerted         INTEGER DEFAULT 0,
     published_datetime TEXT,
     source_name        TEXT,
-    summary            TEXT
+    summary            TEXT,
+    story_key          TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_news_fetched ON news(fetched_at);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -75,7 +84,8 @@ PG_SCHEMA = [
         alerted         INTEGER DEFAULT 0,
         published_datetime TEXT,
         source_name        TEXT,
-        summary            TEXT
+        summary            TEXT,
+        story_key          TEXT
     )""",
     "CREATE INDEX IF NOT EXISTS idx_news_fetched ON news(fetched_at)",
     "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)",
@@ -86,7 +96,7 @@ PG_SCHEMA = [
 # They are listed LAST in CREATE TABLE too, so a freshly-created table and a
 # migrated one have the SAME column order -> `SELECT *` zips against ROW_COLS
 # identically on both paths.
-_ADDED_COLUMNS = ("published_datetime", "source_name", "summary")
+_ADDED_COLUMNS = ("published_datetime", "source_name", "summary", "story_key")
 
 # Column order MUST match the table definition so `SELECT *` rows zip correctly
 # on both backends.
@@ -94,6 +104,7 @@ ROW_COLS = (
     "id", "hash", "title", "url", "source", "published", "fetched_at",
     "topics", "critical_hits", "score", "level", "impact_notes",
     "watchlist_hits", "alerted", "published_datetime", "source_name", "summary",
+    "story_key",
 )
 
 
@@ -193,7 +204,7 @@ def item_hash(item):
 INSERT_COLS = (
     "hash", "title", "url", "source", "published", "fetched_at",
     "topics", "critical_hits", "score", "level", "impact_notes", "watchlist_hits",
-    "published_datetime", "source_name", "summary",
+    "published_datetime", "source_name", "summary", "story_key",
 )
 
 
@@ -214,6 +225,7 @@ def _row_values(item, analysis, now):
         item.get("published_datetime", ""),
         item.get("source_name") or item.get("source", ""),
         item.get("summary", ""),
+        story_key(item.get("title", "")),
     )
 
 
@@ -325,6 +337,52 @@ def mark_alerted(con, ids):
         return
     con.executemany("UPDATE news SET alerted = 1 WHERE id = ?", [(i,) for i in ids])
     con.commit()
+
+
+def backfill_story_keys(con, chunk=200):
+    """Fill story_key for rows inserted before the column existed.
+
+    Returns the number of rows updated. Chunked so one statement never carries
+    more parameters than SQLite/psycopg will accept, and so a large table does
+    not travel to a remote DB in a single enormous round-trip."""
+    rows = con.execute(
+        "SELECT id, title FROM news WHERE story_key IS NULL OR story_key = ''"
+    ).fetchall()
+    if not rows:
+        return 0
+    updated = 0
+    for i in range(0, len(rows), chunk):
+        batch = [(story_key(title or ""), row_id) for row_id, title in rows[i:i + chunk]]
+        con.executemany("UPDATE news SET story_key = ? WHERE id = ?", batch)
+        updated += len(batch)
+    con.commit()
+    return updated
+
+
+def ensure_story_keys(con):
+    """One-time backfill, guarded by meta['story_key_backfilled'].
+
+    Deliberately NOT called from connect(): connect() runs every 15 minutes and
+    a full-table scan across the network on every cycle would spend the very
+    latency budget the bulk-insert work bought back. NEVER raises - it runs on
+    the same path as the dead-man's switch."""
+    try:
+        if get_meta(con, "story_key_backfilled") == "1":
+            return 0
+        n = backfill_story_keys(con)
+        set_meta(con, "story_key_backfilled", "1")
+        if n:
+            log.info("story_key backfilled for %d pre-existing rows", n)
+        return n
+    except Exception as exc:  # noqa: BLE001 - bookkeeping must not break alerts
+        log.warning("story_key backfill skipped: %s", exc)
+        # Postgres aborts the transaction on a failed statement; roll back so the
+        # connection stays usable for the alert that follows.
+        try:
+            con.rollback()
+        except Exception:
+            pass
+        return 0
 
 
 def get_since(con, iso_ts):

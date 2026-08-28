@@ -14,6 +14,9 @@ WHAT IS BEING PROVEN
     D. realtime_job    end-to-end: N news -> 1 request, exactly the rows that
                        went out are marked alerted, nothing is silently lost.
     E. digest          summary + quota warning + dead-man's switch still work.
+    F. clustering      one story carried by several outlets collapses into ONE
+                       card, headlines that merely LOOK alike do not, and every
+                       merged row is still named on the card and marked alerted.
 
 SAFETY: this file never touches the real Supabase DB, never sends to LINE, and
 never fetches news (collect_cycle is stubbed).
@@ -38,7 +41,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
 import main                                   # noqa: E402  (never load_env()!)
-from src import notifier, quota, storage, summarizer  # noqa: E402
+from src import cluster, notifier, quota, storage, summarizer  # noqa: E402
 from src.matcher import Matcher               # noqa: E402
 from src.sources.base import BKK_TZ, now_bkk  # noqa: E402
 
@@ -66,6 +69,12 @@ SETTINGS = {
     "lookback_hours": 24,
     "drop_if_no_date": False,
     "priority_alert_keywords": ["มอก."],
+    # Sections A-E measure the quota machinery, and seed_news deliberately builds
+    # its rows from ONE template that differs only by an index number - which the
+    # story clustering (rightly) reads as the same story. Collapsing is switched
+    # OFF here so those checks keep measuring what they were written to measure;
+    # section F exercises the clustering on real headlines instead.
+    "cluster_enabled": False,
 }
 
 RESULTS = []
@@ -560,6 +569,273 @@ def run_digest(matcher_obj):
 
 
 # =========================================================================
+# F. story clustering (same-story collapse)
+# =========================================================================
+
+# Real Thai steel headlines - the exact shapes that produced the duplicate rows
+# this feature exists to fold together.
+T_LEAD = "สมอ. ถอนอายัดเหล็ก ซิน เคอ หยวน 6.6 หมื่นเส้น ชี้ผลสอบได้มาตรฐาน"
+T_REWRITE = "สมอ. ถอนอายัดเหล็ก ซิน เคอ หยวน 6.6 หมื่นเส้น หลังผลสอบได้มาตรฐาน"
+T_SPACING = "สมอ.ถอนอายัดเหล็ก “ซินเคอหยวน” 6.6 หมื่นเส้น ชี้ผลสอบได้มาตรฐาน"
+IF_PROTEST = "ผู้ผลิตเตา IF ค้านแนวคิด กมอ. ยกเลิกเหล็กข้ออ้อย"
+IF_ANGER = "สมาคมเหล็ก IF โวย มติ กมอ. สั่งเลิกผลิตข้ออ้อย เสียหายแสนล้าน"
+
+SETTINGS_CLUSTER = dict(SETTINGS, cluster_enabled=True)
+
+
+def r(rid, title, when="2026-08-27T10:00:00", outlet="ทดสอบ", score=12):
+    """A bare row dict for the pure clustering checks (no database involved)."""
+    return {"id": rid, "title": title, "published_datetime": when,
+            "source_name": outlet, "level": "RED", "score": score}
+
+
+def seed_real_news(con, specs):
+    """Insert rows built from REAL headlines.
+
+    seed_news() above is deliberately left untouched: it builds every row from
+    one template plus an index, which the clustering correctly reads as a single
+    story - fine for the quota sections (they switch clustering off), useless
+    here."""
+    default = now_bkk().strftime("%Y-%m-%dT%H:%M:%S")
+    pairs = []
+    for i, spec in enumerate(specs):
+        stamp = spec.get("when", default)
+        item = {
+            "title": spec["title"],
+            # A distinct URL per outlet is the whole point: same story, different
+            # url+title -> different hash -> separate rows in the database.
+            "url": spec.get("url", f"https://example.test/real/{i}"),
+            "source": spec.get("outlet", "ทดสอบ"),
+            "source_name": spec.get("outlet", "ทดสอบ"),
+            "published": stamp,
+            "published_datetime": stamp,
+            "summary": spec.get("summary", "เนื้อหาข่าวย่อสำหรับทดสอบการยุบเรื่องซ้ำ."),
+        }
+        analysis = {
+            "topics": ["มาตรฐาน มอก."],
+            "critical_hits": ["มอก."],
+            "score": spec.get("score", 12),
+            "level": spec.get("level", "RED"),
+            "impact_notes": [],
+            "watchlist_hits": [],
+        }
+        pairs.append((item, analysis))
+    storage.insert_many(con, pairs)
+
+
+def section_f():
+    print("\n--- F. ยุบข่าวเรื่องเดียวกัน (story clustering) ---")
+    cfg = cluster.build_cfg(SETTINGS_CLUSTER)
+
+    # --- must collapse ----------------------------------------------------
+    same3 = cluster.group_stories(
+        [r(1, T_LEAD, outlet="ประชาชาติธุรกิจ"),
+         r(2, T_LEAD, outlet="มติชนออนไลน์"),
+         r(3, T_LEAD, outlet="ท็อปนิวส์")], SETTINGS_CLUSTER, label="F1")
+    _, info1 = cluster.same_story(r(1, T_LEAD), r(2, T_LEAD), cfg)
+    check("F1 พาดหัวเหมือนเป๊ะ 3 สำนัก -> 1 เรื่อง (reason=key) ids ครบ 3",
+          len(same3) == 1 and same3[0]["ids"] == [1, 2, 3]
+          and info1["reason"] == "key",
+          f"stories={len(same3)} info={info1}")
+
+    ok2, info2 = cluster.same_story(r(1, T_LEAD), r(2, T_REWRITE), cfg)
+    check("F2 เรียบเรียงต่างเล็กน้อย -> ยุบ (reason=fuzzy)",
+          ok2 and info2["reason"] == "fuzzy" and info2["jaccard"] >= 0.62,
+          f"info={info2}")
+
+    ok3, info3 = cluster.same_story(r(1, T_LEAD), r(2, T_SPACING), cfg)
+    check("F3 เว้นวรรค/อัญประกาศต่าง -> ยุบ (reason=key)",
+          ok3 and info3["reason"] == "key", f"info={info3}")
+
+    # --- must NOT collapse ------------------------------------------------
+    ok4, info4 = cluster.same_story(r(1, IF_PROTEST), r(2, IF_ANGER), cfg)
+    check("F4 ค้าน vs โวย (คนละเหตุการณ์ คำศัพท์ชุดเดียว) -> ห้ามยุบ",
+          not ok4 and info4["jaccard"] < 0.62, f"info={info4}")
+
+    ok5, info5 = cluster.same_story(
+        r(1, "เอกนัฏแจงตั้ง กมอ. ชุดใหม่ เร่งสางปัญหาเหล็กไม่ได้มาตรฐาน"),
+        r(2, "เอกนัฏลั่นซินเคอหยวนต้องรับผิดชอบ สั่งเดินหน้าคดีถึงที่สุด"), cfg)
+    check("F5 ชื่อคนเดียวกันแต่คนละเรื่อง -> ห้ามยุบ", not ok5, f"info={info5}")
+
+    ok6, info6 = cluster.same_story(
+        r(1, "ส.อ.ท. หนุนมาตรการคุมนำเข้าเหล็กจากจีน"),
+        r(2, "10 สมาคมเหล็กยื่นท้วง สมอ. ปมแก้ มอก. เหล็กเส้น"), cfg)
+    check("F6 คนละฝ่าย คนละเรื่อง -> ห้ามยุบ", not ok6, f"info={info6}")
+
+    ok7, info7 = cluster.same_story(
+        r(1, "สหรัฐขึ้นภาษีนำเข้าเหล็กเป็น 50% กระทบผู้ส่งออกไทย"),
+        r(2, "สหรัฐขึ้นภาษีนำเข้าเหล็กเป็น 25% กระทบผู้ส่งออกไทย"), cfg)
+    check("F7 ตัวเลข+หน่วยขัดกัน (50% vs 25%) -> ห้ามยุบ แม้ข้อความคล้ายมาก",
+          not ok7 and info7["reason"] == "blocked-unit", f"info={info7}")
+
+    ok8, info8 = cluster.same_story(
+        r(1, "สมอ. เตรียมแก้ มอก. 24-2559 ตัดเหล็กเส้นจากเตา IF ออกจากมาตรฐาน"),
+        r(2, "สมอ. เตรียมแก้ มอก. 20-2559 ตัดเหล็กเส้นจากเตา IF ออกจากมาตรฐาน"), cfg)
+    check("F8 มอก. 24 vs มอก. 20 (คนละมาตรฐาน) -> ห้ามยุบ",
+          not ok8 and info8["reason"] == "blocked-unit", f"info={info8}")
+
+    ok9, info9 = cluster.same_story(
+        r(1, T_LEAD, when="2026-08-27T10:00:00"),
+        r(2, T_LEAD, when="2026-08-24T10:00:00"), cfg)
+    check("F9 พาดหัวเดียวกันแต่ห่าง 3 วัน (เหตุการณ์ใหม่) -> ห้ามยุบ",
+          not ok9 and info9["reason"] == "blocked-date", f"info={info9}")
+
+    naewna_a = "โลกธุรกิจ - สมอ.ลุยตรวจโรงงานเหล็กทั่วประเทศ - แนวหน้า"
+    naewna_b = "โลกธุรกิจ - ค่าไฟงวดใหม่จ่อลดลง 15 สตางค์ - แนวหน้า"
+    ok10, info10 = cluster.same_story(r(1, naewna_a), r(2, naewna_b), cfg)
+    check("F10 กับดักแนวหน้า (โลกธุรกิจ - ... - แนวหน้า) 2 ข่าวคนละเรื่อง -> ห้ามยุบ",
+          not ok10 and cluster.normalize_title(naewna_a) != "โลกธุรกิจ",
+          f"info={info10} norm={cluster.normalize_title(naewna_a)!r}")
+
+    ok11, info11 = cluster.same_story(
+        r(1, "ศุลกากรจับบารากู่ลักลอบนำเข้า มูลค่า 12 ล้านบาท"),
+        r(2, "ศุลกากรจับของหนีภาษีสำแดงเท็จ มูลค่า 30 ล้านบาท"), cfg)
+    check("F11 ศุลกากรจับคนละของ -> ห้ามยุบ", not ok11, f"info={info11}")
+
+    # --- end to end: realtime_job -----------------------------------------
+    m = make_matcher(cluster_enabled=True)
+    con = fresh_db()
+    storage.set_meta(con, "baseline_seeded", "1")
+    seed_real_news(con, [
+        {"title": T_LEAD, "outlet": "ประชาชาติธุรกิจ", "score": 19},
+        {"title": T_LEAD, "outlet": "มติชนออนไลน์", "score": 18},
+        {"title": T_LEAD, "outlet": "ท็อปนิวส์", "score": 17},
+        {"title": IF_PROTEST, "outlet": "ฐานเศรษฐกิจ", "score": 16},
+        {"title": IF_ANGER, "outlet": "กรุงเทพธุรกิจ", "score": 15},
+    ])
+    con.close()
+    stub = run_realtime(m)
+    con = storage.connect()
+    text = stub.all_text
+    cards = text.count("\U0001f6a8 [CRITICAL ALERT")
+    alerted = n_alerted(con)
+    con.close()
+    check("F12 realtime 5 แถว (ซ้ำ 3) -> 1 request, การ์ด 3 ใบ, mark alerted ครบ 5 แถว",
+          len(stub.calls) == 1 and cards == 3 and alerted == 5,
+          f"calls={len(stub.calls)} cards={cards} alerted={alerted}")
+
+    stub2 = run_realtime(m)
+    check("F13 รอบถัดมา -> เงียบ ไม่ยิงซ้ำ (แถวที่ถูกยุบก็ถูก mark ครบ)",
+          len(stub2.calls) == 0, f"calls={len(stub2.calls)}")
+
+    outlets = ("ประชาชาติธุรกิจ", "มติชนออนไลน์", "ท็อปนิวส์")
+    check("F14 การ์ดบอก 'อีก 2 สำนักรายงานเรื่องเดียวกัน' + ชื่อสำนักครบ 3",
+          "อีก 2 สำนักรายงานเรื่องเดียวกัน" in text
+          and all(o in text for o in outlets),
+          f"missing={[o for o in outlets if o not in text]}")
+
+    # --- the no-hiding rule -----------------------------------------------
+    pair = cluster.group_stories(
+        [r(1, T_LEAD, outlet="ประชาชาติธุรกิจ"),
+         r(2, T_REWRITE, outlet="มติชนออนไลน์")], SETTINGS_CLUSTER, label="F15")
+    view = pair[0]["row"]
+    card = summarizer.build_critical_alert(view, view)
+    check("F15 กฎห้ามซ่อน: ยุบแล้วพาดหัวของสมาชิกที่ต่างต้องยังอยู่ในการ์ด",
+          len(pair) == 1 and T_LEAD in card and T_REWRITE in card
+          and "มติชนออนไลน์" in card,
+          f"stories={len(pair)} rewrite_in_card={T_REWRITE in card}")
+
+    # --- switches / edge cases --------------------------------------------
+    off = cluster.group_stories(
+        [r(1, T_LEAD), r(2, T_LEAD), r(3, T_LEAD)],
+        dict(SETTINGS_CLUSTER, cluster_enabled=False), label="F16")
+    check("F16 cluster_enabled=false -> 1 แถว 1 เรื่อง (กลับพฤติกรรมเดิม 100%)",
+          len(off) == 3 and all(len(s["ids"]) == 1 for s in off)
+          and all(s["row"]["also_reported"] == [] for s in off),
+          f"stories={len(off)}")
+
+    one = cluster.group_stories([r(1, T_LEAD)], SETTINGS_CLUSTER, label="F17")
+    check("F17 rows ว่าง -> [] และ 1 แถว -> 1 เรื่อง",
+          cluster.group_stories([], SETTINGS_CLUSTER) == []
+          and cluster.group_stories(None, SETTINGS_CLUSTER) == []
+          and len(one) == 1 and one[0]["ids"] == [1])
+
+    raised = None
+    try:
+        big = cluster.group_stories(
+            [r(i, T_LEAD) for i in range(1, 4)],
+            dict(SETTINGS_CLUSTER, cluster_max_rows=2), label="F18")
+    except Exception as exc:  # noqa: BLE001
+        raised, big = exc, []
+    check("F18 แถวเกิน cluster_max_rows -> ข้ามการยุบ (identity) ไม่ raise",
+          raised is None and len(big) == 3, f"raised={raised!r} stories={len(big)}")
+
+    raised = None
+    try:
+        weird = cluster.group_stories(
+            [{"id": 1}, {"id": 2, "title": None},
+             {"id": 3, "title": T_LEAD, "published_datetime": "ไม่ใช่วันที่"}],
+            SETTINGS_CLUSTER, label="F19")
+    except Exception as exc:  # noqa: BLE001
+        raised, weird = exc, []
+    check("F19 แถวไม่มี title / วันที่พัง -> ไม่ raise และไม่ยุบมั่ว",
+          raised is None and len(weird) == 3,
+          f"raised={raised!r} stories={len(weird)}")
+
+    blanks = [r(1, "   "), r(2, "!!!"), r(3, "???")]
+    blank_groups = cluster.group_stories(blanks, SETTINGS_CLUSTER, label="F21")
+    ok_blank, info_blank = cluster.same_story(blanks[0], blanks[1], cfg)
+    check("F21 story_key ว่าง ('') ต้องไม่ถือว่าตรงกัน",
+          cluster.story_key("!!!") == "" and not ok_blank
+          and len(blank_groups) == 3,
+          f"stories={len(blank_groups)} info={info_blank}")
+
+    # --- digest ------------------------------------------------------------
+    md = make_matcher(cluster_enabled=True)
+    saved_quota_status = notifier.line_quota_status
+    notifier.line_quota_status = lambda: (None, None)
+    try:
+        con = fresh_db()
+        storage.set_meta(con, "last_summary_at", "2000-01-01T00:00:00")
+        seed_real_news(con, [
+            {"title": T_LEAD, "outlet": "ประชาชาติธุรกิจ", "score": 19},
+            {"title": T_REWRITE, "outlet": "มติชนออนไลน์", "score": 18},
+            {"title": T_SPACING, "outlet": "ท็อปนิวส์", "score": 17},
+            {"title": IF_PROTEST, "outlet": "ฐานเศรษฐกิจ", "score": 16},
+            {"title": IF_ANGER, "outlet": "กรุงเทพธุรกิจ", "score": 15},
+        ])
+        con.close()
+        dstub = run_digest(md)
+    finally:
+        notifier.line_quota_status = saved_quota_status
+    dtext = dstub.all_text
+    missing = [t for t in (T_LEAD, T_REWRITE, IF_PROTEST, IF_ANGER) if t not in dtext]
+    check("F20 digest: header 'ข่าวใหม่ 3 เรื่อง (จาก 5 ชิ้น)' + พาดหัวทุกใบยังอยู่",
+          "ข่าวใหม่ 3 เรื่อง (จาก 5 ชิ้น)" in dtext and not missing
+          and "ท็อปนิวส์" in dtext,
+          f"missing={missing}")
+
+    # --- backfill ----------------------------------------------------------
+    con = fresh_db()
+    seed_real_news(con, [
+        {"title": T_LEAD, "outlet": "ประชาชาติธุรกิจ", "score": 19},
+        {"title": IF_PROTEST, "outlet": "ฐานเศรษฐกิจ", "score": 18},
+        {"title": IF_ANGER, "outlet": "กรุงเทพธุรกิจ", "score": 17},
+    ])
+    con.execute("UPDATE news SET story_key = NULL")
+    con.commit()
+    blank_before = con.execute(
+        "SELECT COUNT(*) FROM news WHERE story_key IS NULL").fetchone()[0]
+    first = storage.ensure_story_keys(con)
+    still_blank = con.execute(
+        "SELECT COUNT(*) FROM news WHERE story_key IS NULL OR story_key = ''"
+    ).fetchone()[0]
+    second = storage.ensure_story_keys(con)
+    # E4 guard: story_key was appended LAST everywhere, so `SELECT *` must still
+    # zip against ROW_COLS - a shifted column would silently corrupt level/score.
+    back = storage.get_since(con, "")
+    cols_ok = (all(row["level"] == "RED" for row in back)
+               and sorted(row["score"] for row in back) == [17, 18, 19]
+               and all(row["story_key"] for row in back))
+    con.close()
+    check("F22 backfill: เติม story_key ครบ, เรียกซ้ำ = 0 แถว, คอลัมน์ไม่สลับ (level/score ถูก)",
+          blank_before == 3 and first == 3 and still_blank == 0 and second == 0
+          and cols_ok,
+          f"before={blank_before} first={first} left={still_blank} "
+          f"second={second} cols_ok={cols_ok}")
+
+
+# =========================================================================
 
 def main_test():
     if hasattr(sys.stdout, "reconfigure"):
@@ -573,6 +849,7 @@ def main_test():
         section_c()
         section_d()
         section_e()
+        section_f()
     finally:
         storage.connect = _real_connect
         shutil.rmtree(TMP_DIR, ignore_errors=True)

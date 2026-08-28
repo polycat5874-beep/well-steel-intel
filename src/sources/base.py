@@ -122,6 +122,11 @@ def _parse_bkk(iso_str):
     return dt.astimezone(BKK_TZ)
 
 
+def parse_bkk(value):
+    """Public alias of _parse_bkk (cluster.py needs the same date parsing)."""
+    return _parse_bkk(value)
+
+
 def is_fresh(published_iso, lookback_hours=24, keep_if_unknown=True, now=None):
     """True if the article was published within `lookback_hours`.
 

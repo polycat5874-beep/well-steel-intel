@@ -11,6 +11,8 @@ CLI:
   python main.py --summary  force a daily summary now then exit
   python main.py --quota    print the LINE push-quota status (sends nothing)
   python main.py --quota-set-month N   backfill this month's request counter
+  python main.py --cluster-report      read-only same-story duplicate audit
+  python main.py --backfill-story-keys fill story_key for pre-existing rows
 """
 import argparse
 import json
@@ -18,12 +20,13 @@ import logging
 import logging.handlers
 import os
 import sys
+import time
 from datetime import datetime, timedelta
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
-from src import storage, notifier, summarizer, quota  # noqa: E402
+from src import storage, notifier, summarizer, quota, cluster  # noqa: E402
 from src.matcher import Matcher  # noqa: E402
 from src.sources import google_news, rss_feeds, gov_sites  # noqa: E402
 from src.sources.base import (  # noqa: E402
@@ -162,6 +165,10 @@ def realtime_job(matcher_obj):
 
     con = storage.connect()
     try:
+        try:
+            storage.ensure_story_keys(con)
+        except Exception as exc:  # never let a backfill cost an alert
+            log.warning("story_key backfill skipped: %s", exc)
         pending = storage.get_unalerted_critical(
             con, matcher_obj.settings.get("priority_alert_keywords", []))
         if not pending:
@@ -205,6 +212,15 @@ def realtime_job(matcher_obj):
             log.info("no fresh critical news pending alert")
             return
 
+        # Story collapse (DISPLAY ONLY - nothing is deleted, no hash changes).
+        # One event carried by three outlets is three rows with three different
+        # hashes, so this push used to spend three cards on one story. Rows
+        # arrive ordered score DESC, so each group is led by its highest-scoring
+        # telling; every other member is still named on the card (no-hiding
+        # rule), and EVERY member id is marked alerted below.
+        stories = cluster.group_stories(pending, matcher_obj.settings,
+                                        label="realtime")
+
         # Push budget. LINE bills per REQUEST x recipients, and this loop used
         # to fire one request per news item - 8 alerts = 8 pushes, which on
         # 2026-08-27 ate a fifth of the monthly quota in a single cycle. Now the
@@ -217,29 +233,34 @@ def realtime_job(matcher_obj):
         if budget_left <= 0:
             # Out of budget: only a genuinely top-level story may still buy an
             # emergency push, and only while the override reserve holds.
-            top = [r for r in pending if r.get("level") in override_levels]
+            top = [s for s in stories if s["row"].get("level") in override_levels]
             if not top or quota.override_left(con, matcher_obj.settings) <= 0:
                 # Deliberately NOT marking anything alerted: these items stay
                 # pending and are re-offered next cycle / in the daily digest.
                 log.info("push budget spent: deferring %d critical items", len(pending))
                 return
-            pending = top
+            stories = top
             is_override = True
-            log.warning("push budget spent; spending override push on %d %s items",
+            log.warning("push budget spent; spending override push on %d %s stories",
                         len(top), "/".join(override_levels))
 
         # Build self-contained blocks + the row ids each one accounts for, so
         # only what actually went out gets marked alerted.
-        detailed, overflow = pending[:cap], pending[cap:]
-        blocks = [summarizer.build_alert_batch_header(len(pending), len(detailed))]
+        detailed, overflow = stories[:cap], stories[cap:]
+        blocks = [summarizer.build_alert_batch_header(len(stories), len(detailed))]
         block_rows = [[]]
-        for i, row in enumerate(detailed, 1):
+        for i, story in enumerate(detailed, 1):
+            row = story["row"]
             blocks.append(summarizer.build_critical_alert(
                 row, row, index=i, total=len(detailed)))
-            block_rows.append([row["id"]])
+            # ids, not [row["id"]]: a card speaks for its whole group, so every
+            # row it covers must be marked alerted or the merged-away rows would
+            # come back as "new" and be alerted again next cycle.
+            block_rows.append(story["ids"])
         if overflow:
-            blocks.append(summarizer.build_extra_headlines(overflow))
-            block_rows.append([r["id"] for r in overflow])
+            blocks.append(summarizer.build_extra_headlines(
+                [s["row"] for s in overflow]))
+            block_rows.append([i for s in overflow for i in s["ids"]])
 
         ok, used, covered = notifier.send_blocks(blocks, max_requests=1)
         # mark_alerted follows `covered`, NEVER `ok`: on dry-run (no credentials)
@@ -250,8 +271,12 @@ def realtime_job(matcher_obj):
         quota.record(con, used, kind="realtime", override=is_override)
         if not ok and used and notifier.active_channel() == "line":
             log.warning("LINE reported a delivery failure for this alert batch")
-        log.info("alerted %d critical items in %d LINE request(s); deferred %d",
-                 len(sent_ids), used, len(pending) - len(sent_ids))
+        sent_set = set(sent_ids)
+        n_stories = sum(1 for s in stories
+                        if s["ids"] and all(i in sent_set for i in s["ids"]))
+        log.info("alerted %d rows as %d stories in %d LINE request(s);"
+                 " deferred %d rows",
+                 len(sent_ids), n_stories, used, len(pending) - len(sent_ids))
     finally:
         con.close()
 
@@ -277,9 +302,19 @@ def daily_summary_job(matcher_obj, round_label):
     con = None
     try:
         con = storage.connect()
+        try:
+            storage.ensure_story_keys(con)
+        except Exception as exc:  # never let a backfill trip the dead-man switch
+            log.warning("story_key backfill skipped: %s", exc)
         fallback = (datetime.now() - timedelta(hours=24)).isoformat(timespec="seconds")
         since = storage.get_meta(con, "last_summary_at", fallback)
         items = storage.get_since(con, since)
+        # Collapse same-story rows for the digest too, keeping the raw row count
+        # so the header can say "N เรื่อง (จาก M ชิ้น)" instead of looking like
+        # the watcher simply found fewer articles.
+        n_rows = len(items)
+        items = [s["row"] for s in
+                 cluster.group_stories(items, matcher_obj.settings, label="digest")]
         if collect_error:
             health = f"เก็บข่าวรอบนี้ล้มเหลว: {str(collect_error)[:120]}"
         else:
@@ -299,7 +334,8 @@ def daily_summary_job(matcher_obj, round_label):
         except Exception as exc:
             log.warning("quota warning check skipped: %s", exc)
         msg = summarizer.build_daily_summary(
-            items, matcher_obj.cfg["watchlist"], round_label, health=health
+            items, matcher_obj.cfg["watchlist"], round_label, health=health,
+            n_rows=n_rows,
         )
         ok, used = notifier.send_counted(msg)
         quota.record(con, used, kind="summary")
@@ -346,6 +382,111 @@ def quota_cli(matcher_obj, set_month=None):
         con.close()
 
 
+def cluster_report_cli(matcher_obj, limit=None):
+    """--cluster-report: READ-ONLY same-story audit.
+
+    Sends nothing, marks nothing alerted, writes no meta counter. Run it before
+    touching any cluster_* threshold: it prints EVERY group the current settings
+    would merge together with all member headlines and the gate that matched, so
+    a bad threshold is caught here instead of by a reader who never finds out a
+    story went missing."""
+    con = storage.connect()
+    try:
+        rows = storage.get_since(con, "")     # every row, ORDER BY score, id
+        total = len(rows)
+        keys = [cluster.story_key(r.get("title") or "") for r in rows]
+        # An empty key means "no comparable headline"; each such row counts as
+        # its own story rather than collapsing them all together.
+        distinct = len({k for k in keys if k}) + sum(1 for k in keys if not k)
+        dup = total - distinct
+        pct = (dup / total * 100) if total else 0.0
+
+        print("รายงานข่าวซ้ำ (cluster report) — อ่านอย่างเดียว "
+              "ไม่ส่ง LINE ไม่แก้สถานะแจ้งเตือน")
+        print("=" * 66)
+        print("ฐานข้อมูลทั้งหมด")
+        print(f"  แถวทั้งหมด               : {total:,}")
+        print(f"  เรื่องไม่ซ้ำ (story_key)   : {distinct:,}")
+        print(f"  แถวที่เป็นเรื่องซ้ำ        : {dup:,} ({pct:.1f}%)")
+
+        # Same population get_unalerted_critical draws from, minus the alerted
+        # filter (on a live DB almost everything is already alerted, and an audit
+        # that saw nothing would be useless).
+        priority = [k.lower() for k in
+                    matcher_obj.settings.get("priority_alert_keywords", [])]
+        eligible = []
+        for row in rows:
+            if not row.get("critical_hits"):
+                continue
+            if row.get("level") in ("RED", "ORANGE"):
+                eligible.append(row)
+            elif row.get("level") == "YELLOW" and any(
+                    str(h).lower() in priority for h in row["critical_hits"]):
+                eligible.append(row)
+        if limit:
+            eligible = eligible[:limit]
+
+        settings = dict(matcher_obj.settings)
+        settings["cluster_enabled"] = True
+        # The audit must always actually run, even past the production guard.
+        settings["cluster_max_rows"] = max(len(eligible), 1)
+        cfg = cluster.build_cfg(settings)
+        started = time.time()
+        stories = cluster.group_stories(eligible, settings, label="report")
+        elapsed = time.time() - started
+        collapsed = len(eligible) - len(stories)
+        cpct = (collapsed / len(eligible) * 100) if eligible else 0.0
+
+        print("")
+        print("จำลองการยุบบนแถวที่เข้าเกณฑ์ยิงเตือน (alert-eligible)")
+        print(f"  แถวเข้าเกณฑ์              : {len(eligible):,}")
+        print(f"  ยุบแล้วเหลือการ์ด          : {len(stories):,}")
+        print(f"  ยุบไปได้                 : {collapsed:,} แถว ({cpct:.1f}%)")
+        print(f"  เวลาที่ใช้                : {elapsed:.2f} วินาที")
+        print(f"  เกณฑ์ที่ใช้               : jaccard>={cfg['cluster_jaccard_min']}"
+              f" ratio>={cfg['cluster_ratio_min']}"
+              f" len>={cfg['cluster_len_ratio_min']}"
+              f" window={cfg['cluster_window_hours']}h"
+              f" ngram={cfg['cluster_ngram']}")
+
+        merged = [s for s in stories if len(s["members"]) > 1]
+        print("")
+        print(f"กลุ่มที่ถูกยุบ {len(merged)} กลุ่ม "
+              "(กางครบทุกกลุ่ม พาดหัวครบทุกใบ — ตรวจว่ายุบผิดไหม)")
+        print("-" * 66)
+        for n, story in enumerate(merged, 1):
+            members = story["members"]
+            lead = members[0]
+            print(f"[{n}] {len(members)} ใบ · {lead.get('level')} "
+                  f"score {lead.get('score')}")
+            print(f"    ★ id={lead.get('id')} [{lead.get('source_name') or '-'}]"
+                  f" {lead.get('published_datetime') or '-'}")
+            print(f"      {lead.get('title')}")
+            for other in members[1:]:
+                _, info = cluster.same_story(lead, other, cfg)
+                print(f"    + id={other.get('id')}"
+                      f" [{other.get('source_name') or '-'}]"
+                      f" {other.get('published_datetime') or '-'}"
+                      f"  ({info['reason']} j={info['jaccard']:.2f}"
+                      f" r={info['ratio']:.2f})")
+                print(f"      {other.get('title')}")
+        if not merged:
+            print("  (ไม่มีกลุ่มไหนถูกยุบด้วยเกณฑ์ปัจจุบัน)")
+    finally:
+        con.close()
+
+
+def backfill_cli():
+    """--backfill-story-keys: force the story_key backfill to run again."""
+    con = storage.connect()
+    try:
+        n = storage.backfill_story_keys(con)
+        storage.set_meta(con, "story_key_backfilled", "1")
+        print(f"เติม story_key ให้แถวเดิมแล้ว {n:,} แถว")
+    finally:
+        con.close()
+
+
 def run_scheduler(matcher_obj):
     from apscheduler.schedulers.blocking import BlockingScheduler
 
@@ -375,13 +516,23 @@ def main():
                         help="print LINE push-quota status (sends nothing)")
     parser.add_argument("--quota-set-month", type=int, metavar="N",
                         help="backfill this month's request counter to N")
+    parser.add_argument("--cluster-report", action="store_true",
+                        help="read-only same-story duplicate audit (sends nothing)")
+    parser.add_argument("--limit", type=int, metavar="N",
+                        help="cluster-report: only audit the first N eligible rows")
+    parser.add_argument("--backfill-story-keys", action="store_true",
+                        help="fill story_key for rows stored before the column existed")
     args = parser.parse_args()
 
     load_env()
     setup_logging()
     matcher_obj = Matcher()
 
-    if args.quota or args.quota_set_month is not None:
+    if args.cluster_report:
+        cluster_report_cli(matcher_obj, args.limit)
+    elif args.backfill_story_keys:
+        backfill_cli()
+    elif args.quota or args.quota_set_month is not None:
         quota_cli(matcher_obj, args.quota_set_month)
     elif args.once:
         realtime_job(matcher_obj)
