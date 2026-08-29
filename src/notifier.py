@@ -36,9 +36,32 @@ BLOCK_SEP = "\n\n"   # joiner between two whole cards packed into one text objec
 
 _token_cache = {"token": None}  # in-process cache for an auto-issued token
 
+# Sentinel for "send this to everyone who added the OA", as opposed to None,
+# which means "whatever LINE_USER_ID says" (the behaviour that shipped first).
+BROADCAST = "__broadcast__"
+
 # --- Telegram (fallback) ---
 TELEGRAM_URL = "https://api.telegram.org/bot{token}/sendMessage"
 TELEGRAM_LIMIT = 4000       # Telegram hard limit is 4096 chars per message
+
+
+def _resolve_target(to):
+    """Which LINE recipient one send should go to.
+
+    None -> legacy env behaviour; BROADCAST -> force broadcast; else push to id.
+    Returns the user id to push to, or None to broadcast.
+
+    NOTE: no id-format validation here on purpose - see src/audience.py. This
+    module is a dumb pipe: it sends where it is told. Deciding whether an id is
+    well formed (and what to do when it is not) is a routing decision and lives
+    with the rest of the routing, so tests and manual pokes can address any
+    string they like.
+    """
+    if to is None:
+        return os.getenv("LINE_USER_ID") or None
+    if to == BROADCAST:
+        return None
+    return to or None
 
 
 def _chunk(text, limit):
@@ -214,9 +237,12 @@ def _line_post(url, payload, token):
         return False, False
 
 
-def _send_line_requests(requests_objects):
+def _send_line_requests(requests_objects, to=None):
     """Send pre-planned LINE requests. `requests_objects` is a list of requests,
     each a list of <=5 text-object strings.
+
+    `to` picks the recipient (see _resolve_target): None keeps the original
+    env-driven behaviour, BROADCAST forces a broadcast, an id pushes to it.
 
     Returns (ok, n_requests) where n_requests is what LINE actually BILLED. A
     401 retry does not count twice: the rejected attempt never reached the
@@ -229,7 +255,7 @@ def _send_line_requests(requests_objects):
         log.warning("no LINE token available")
         return False, 0
 
-    user_id = os.getenv("LINE_USER_ID")
+    user_id = _resolve_target(to)
     url = LINE_PUSH_URL if user_id else LINE_BROADCAST_URL
     mode = "push" if user_id else "broadcast"
     log.info("LINE send mode: %s", mode)
@@ -254,13 +280,13 @@ def _line_plan_for_text(text):
             for i in range(0, len(chunks), LINE_MAX_OBJECTS)]
 
 
-def _send_line(text):
+def _send_line(text, to=None):
     """Send to LINE. If LINE_USER_ID is set -> push to that user; otherwise
     -> broadcast to all friends of the Official Account. Chunks are packed into
     as few requests as possible (<=5 objects each) to conserve push quota. If the
     token is rejected (expired), it is re-minted from id+secret and retried once.
     Returns (ok, n_requests)."""
-    return _send_line_requests(_line_plan_for_text(text))
+    return _send_line_requests(_line_plan_for_text(text), to=to)
 
 
 def _telegram_post(text):
@@ -292,31 +318,37 @@ def _dry_run(text):
     return False
 
 
-def send_counted(text):
+def send_counted(text, to=None):
     """Same as send(), but also reports how many API requests it cost.
 
     Returns (ok, n_requests). The count is what the quota bookkeeping records;
     on dry-run it is the number of requests the message WOULD have cost, so
-    local runs still exercise the budget logic."""
+    local runs still exercise the budget logic.
+
+    Telegram note: `to` is a LINE concept. Telegram always delivers to the one
+    configured chat, which is by definition a SPECIFIC destination, so it counts
+    as a private channel - a public-audience message landing there is merely
+    less detailed than it could be, never a leak."""
     channel = active_channel()
     if channel == "line":
-        return _send_line(text)
+        return _send_line(text, to=to)
     if channel == "telegram":
         return _send_telegram(text)
     return _dry_run(text), len(_line_plan_for_text(text))
 
 
-def send(text):
+def send(text, to=None):
     """Send a notification through the active channel. Returns True if delivered,
     False on dry-run or delivery failure (failures are logged, never raised)."""
-    return send_counted(text)[0]
+    return send_counted(text, to=to)[0]
 
 
-def send_blocks(blocks, max_requests=None):
+def send_blocks(blocks, max_requests=None, to=None):
     """Send whole message blocks packed into as few requests as possible.
 
     `max_requests` caps how many requests this call may spend; anything that
     does not fit is simply NOT sent (the caller re-offers it next cycle).
+    `to` picks the recipient (see _resolve_target).
 
     Returns (ok, requests_used, covered) where `covered` is the set of block
     indices that were actually delivered in full. A block that got split across
@@ -338,7 +370,7 @@ def send_blocks(blocks, max_requests=None):
 
     channel = active_channel()
     if channel == "line":
-        ok, used = _send_line_requests([r["objects"] for r in taken])
+        ok, used = _send_line_requests([r["objects"] for r in taken], to=to)
         return ok, used, covered
     if channel == "telegram":
         ok, used = True, 0

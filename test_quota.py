@@ -17,6 +17,9 @@ WHAT IS BEING PROVEN
     F. clustering      one story carried by several outlets collapses into ONE
                        card, headlines that merely LOOK alike do not, and every
                        merged row is still named on the card and marked alerted.
+    G. audience        the team broadcast carries the news and NOTHING from the
+                       operator profile, the private channel keeps the full
+                       reading, and a malformed destination fails loudly.
 
 SAFETY: this file never touches the real Supabase DB, never sends to LINE, and
 never fetches news (collect_cycle is stubbed).
@@ -32,6 +35,9 @@ for _k in ("LINE_CHANNEL_ID", "LINE_CHANNEL_SECRET",
 for _k in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
     os.environ.pop(_k, None)
 
+import contextlib                            # noqa: E402
+import io                                     # noqa: E402
+import json                                   # noqa: E402
 import logging                                # noqa: E402
 import shutil                                 # noqa: E402
 import tempfile                               # noqa: E402
@@ -41,7 +47,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
 import main                                   # noqa: E402  (never load_env()!)
-from src import cluster, notifier, quota, storage, summarizer  # noqa: E402
+from src import audience, cluster, notifier, quota, storage, summarizer  # noqa: E402
 from src.matcher import Matcher               # noqa: E402
 from src.sources.base import BKK_TZ, now_bkk  # noqa: E402
 
@@ -69,6 +75,11 @@ SETTINGS = {
     "lookback_hours": 24,
     "drop_if_no_date": False,
     "priority_alert_keywords": ["มอก."],
+    # Mirrors config/keywords.json: the team is served the evening digest only,
+    # and never the realtime stream.
+    "team_digest_rounds": [18],
+    "team_realtime_alerts": False,
+    "line_team_recipients": 2,
     # Sections A-E measure the quota machinery, and seed_news deliberately builds
     # its rows from ONE template that differs only by an index number - which the
     # story clustering (rightly) reads as the same story. Collapsing is switched
@@ -836,6 +847,466 @@ def section_f():
 
 
 # =========================================================================
+# G. audience: who gets what, and what must never leave the building
+# =========================================================================
+
+# A profile whose every sentence is unmistakable. If ANY of these strings shows
+# up in a public message, something in the chain leaked - there is no innocent
+# way for them to appear in a headline.
+SENTINEL_NOTE = "ตราลับหนึ่ง ข้อมูลภายในบริษัทห้ามเผยแพร่สู่สาธารณะ"
+SENTINEL_WATCH = "ตราลับสอง เรื่องที่บริษัทเกาะติดเป็นความลับภายใน"
+SENTINEL_WNOTE = "ตราลับสาม บันทึกภายในห้ามส่งต่อบุคคลภายนอกเด็ดขาด"
+SENTINEL_PERSONA = "ตราลับสี่ บทบาทนักวิเคราะห์ที่บอกตัวตนบริษัทเจ้าของระบบ"
+SENTINELS = (SENTINEL_NOTE, SENTINEL_WATCH, SENTINEL_WNOTE, SENTINEL_PERSONA)
+
+SENTINEL_PROFILE = {
+    "company_profile": {"boosts": [
+        {"keywords": ["เตา IF", "มอก. 24"], "score": 5, "note": SENTINEL_NOTE},
+    ]},
+    "watchlist": [
+        {"id": "sentinel", "title": SENTINEL_WATCH, "deadline": None,
+         "keywords": ["มอก.", "เตา IF"], "note": SENTINEL_WNOTE},
+    ],
+    "ai_persona": SENTINEL_PERSONA,
+}
+
+GOOD_ID = "U" + "a1b2c3d4" * 4          # U + 32 hex chars
+
+
+class using_profile:
+    """Context manager: run with a given profile overlay in force."""
+
+    def __init__(self, profile):
+        self.profile = profile
+
+    def __enter__(self):
+        self._saved = os.environ.get("STEEL_INTEL_PROFILE_JSON")
+        if self.profile is None:
+            os.environ.pop("STEEL_INTEL_PROFILE_JSON", None)
+        else:
+            os.environ["STEEL_INTEL_PROFILE_JSON"] = json.dumps(self.profile)
+        audience.reset_cache()
+        return self
+
+    def __exit__(self, *exc):
+        if self._saved is None:
+            os.environ.pop("STEEL_INTEL_PROFILE_JSON", None)
+        else:
+            os.environ["STEEL_INTEL_PROFILE_JSON"] = self._saved
+        audience.reset_cache()
+        return False
+
+
+def sentinel_matcher(**overrides):
+    """A Matcher carrying the sentinel watchlist (must be built INSIDE
+    `using_profile`, since Matcher reads the overlay once, at construction)."""
+    m = Matcher()
+    m.settings = dict(SETTINGS)
+    m.settings.update(overrides)
+    return m
+
+
+def seed_secret_news(con, n=3):
+    """Rows whose stored analysis carries the sentinel note + watchlist hit -
+    i.e. exactly the fields the public version must not print."""
+    stamp = now_bkk().strftime("%Y-%m-%dT%H:%M:%S")
+    pairs = []
+    for i in range(n):
+        item = {
+            "title": f"ข่าวลับ {i} สมอ. เตรียมแก้ มอก. 24-2559 ตัดเหล็กเส้นเตา IF",
+            "url": f"https://example.test/secret/{i}",
+            "source": "ทดสอบ",
+            "source_name": "ประชาชาติธุรกิจ",
+            "published": stamp,
+            "published_datetime": stamp,
+            "summary": f"เนื้อหาข่าวทดสอบชิ้นที่ {i} สำหรับตรวจการแยกฉบับสาธารณะ.",
+        }
+        analysis = {
+            "topics": ["มาตรฐาน มอก."],
+            "critical_hits": ["มอก."],
+            "score": 21,
+            "level": "RED",
+            "impact_notes": [SENTINEL_NOTE],
+            "watchlist_hits": [SENTINEL_WATCH],
+        }
+        pairs.append((item, analysis))
+    storage.insert_many(con, pairs)
+
+
+def run_realtime_as(matcher_obj, user_id=None):
+    with line_channel(user_id=user_id) as s:
+        main.realtime_job(matcher_obj)
+    return s
+
+
+def run_digest_as(matcher_obj, user_id=None, round_hour=None):
+    # line_quota_status() is a live GET against api.line.me - stubbed here so a
+    # test never leaves the machine (same guard section E uses).
+    saved = notifier.line_quota_status
+    notifier.line_quota_status = lambda: (None, None)
+    try:
+        with line_channel(user_id=user_id) as s:
+            main.daily_summary_job(matcher_obj, "ทดสอบ", round_hour)
+    finally:
+        notifier.line_quota_status = saved
+    return s
+
+
+def pushed(stub):
+    """Text of the requests that went to a specific recipient (push)."""
+    return "\n".join(m["text"] for c in stub.calls
+                     for m in c["payload"]["messages"] if "to" in c["payload"])
+
+
+def broadcast(stub):
+    """Text of the requests that went to everyone (broadcast)."""
+    return "\n".join(m["text"] for c in stub.calls
+                     for m in c["payload"]["messages"] if "to" not in c["payload"])
+
+
+def section_g():
+    print("\n--- G. แยกฉบับเต็ม/ฉบับสาธารณะ (audience) ---")
+
+    # --- G1/G2: field projection, the layer everything rests on ------------
+    row = {
+        "id": 7, "title": "พาดหัวข่าว", "url": "https://x.test/a",
+        "source_name": "ประชาชาติธุรกิจ", "level": "RED", "topics": ["มอก."],
+        "score": 21, "critical_hits": ["มอก."], "impact_notes": ["โน้ตลับ"],
+        "watchlist_hits": ["เกาะติดลับ"], "hash": "deadbeef", "story_key": "k",
+        "alerted": 0,
+        # The whole point: a field nobody has written yet.
+        "secret_new_field_2027": "ความลับที่ยังไม่มีใครเขียนโค้ดรองรับ",
+    }
+    pub = audience.public_row(row)
+    dropped = [k for k in ("score", "critical_hits", "impact_notes",
+                           "watchlist_hits", "hash", "story_key", "alerted",
+                           "secret_new_field_2027") if k in pub]
+    check("G1 ฟิลด์ลับ (รวมฟิลด์ใหม่ที่ยังไม่มีใครเขียน) ไม่ติดไปกับฉบับสาธารณะ",
+          not dropped and pub["title"] == "พาดหัวข่าว" and pub["level"] == "RED"
+          and "secret_new_field_2027" in row,   # ต้นฉบับต้องไม่ถูกแก้
+          f"หลุดมา: {dropped}")
+
+    member = {"id": 8, "title": "พาดหัวสำนักอื่น", "source_name": "มติชน",
+              "impact_notes": ["โน้ตลับของสมาชิก"], "score": 19}
+    grouped = dict(row)
+    grouped["also_reported"] = [member]        # cluster.py เก็บ dict ตัวจริง
+    pub2 = audience.public_row(grouped)
+    inner = pub2["also_reported"][0]
+    check("G2 ฉายลึกถึง also_reported (สมาชิกที่ถูกยุบก็ต้องโดนตัดฟิลด์ลับ)",
+          "impact_notes" not in inner and "score" not in inner
+          and inner["title"] == "พาดหัวสำนักอื่น"
+          and "impact_notes" in member,        # ต้นฉบับสมาชิกต้องไม่ถูกแก้
+          f"inner={sorted(inner)}")
+
+    # --- G3: the public alert card ---------------------------------------
+    full_row = dict(row)
+    full_row["published_datetime"] = "2026-08-27T10:00:00"
+    full_row["summary"] = "เนื้อหาข่าวย่อสำหรับตรวจการ์ด."
+    full_row["also_reported"] = [dict(member)]
+    pub_card = summarizer.build_critical_alert(
+        audience.public_row(full_row), audience.public_row(full_row),
+        index=1, total=1, audience="public")
+    full_card = summarizer.build_critical_alert(full_row, full_row, index=1, total=1)
+    hidden_ok = not any(m in pub_card for m in
+                        ("ผลกระทบต่อบริษัท", "คะแนน", "คำสำคัญที่พบ",
+                         "⏳ เกาะติด", "โน้ตลับ", "เกาะติดลับ"))
+    kept_ok = all(m in pub_card for m in
+                  ("พาดหัวข่าว", "ประชาชาติธุรกิจ", "27/08/2026",
+                   "https://x.test/a", "ระดับความสำคัญ", "ต้องรู้วันนี้",
+                   "อีก 1 สำนักรายงานเรื่องเดียวกัน", "พาดหัวสำนักอื่น"))
+    full_ok = "💥 ผลกระทบต่อบริษัท" in full_card and "โน้ตลับ" in full_card
+    check("G3 การ์ดฉบับสาธารณะ: ตัดผลกระทบ/คะแนน/คำสำคัญ/เกาะติด แต่คงข่าว "
+          "+ 'อีก N สำนัก' (ฉบับเต็มยังเหมือนเดิม)",
+          hidden_ok and kept_ok and full_ok,
+          f"hidden_ok={hidden_ok} kept_ok={kept_ok} full_ok={full_ok}\n{pub_card}")
+
+    # --- G4: nothing from the operator profile may reach the broadcast ----
+    with using_profile(SENTINEL_PROFILE):
+        m_s = sentinel_matcher()
+        con = fresh_db()
+        storage.set_meta(con, "baseline_seeded", "1")
+        seed_secret_news(con, 3)
+        con.close()
+        rt = run_realtime_as(m_s)
+        con = fresh_db()
+        storage.set_meta(con, "baseline_seeded", "1")
+        storage.set_meta(con, "last_summary_at", "2000-01-01T00:00:00")
+        seed_secret_news(con, 3)
+        con.close()
+        dg = run_digest_as(m_s)
+        public_text = rt.all_text + "\n" + dg.all_text
+        leaked = [s for s in SENTINELS if s in public_text]
+        # No redaction marker either: layers 1-2 must do the job on their own,
+        # or the guard is quietly carrying the whole design.
+        guard_fired = audience.REDACTED_BLOCK in public_text
+        news_ok = "ข่าวลับ 0" in public_text        # the NEWS still goes out
+
+    # Same again against the operator's REAL profile when one is installed on
+    # this machine (empty list on CI, where the file is absent by design).
+    with using_profile(None):
+        real_secrets = audience.profile_secrets()
+        m_r = make_matcher()
+        con = fresh_db()
+        storage.set_meta(con, "baseline_seeded", "1")
+        storage.set_meta(con, "last_summary_at", "2000-01-01T00:00:00")
+        seed_news(con, 3)
+        con.close()
+        real_pub = run_digest_as(m_r).all_text
+        real_leaked = [s for s in real_secrets if s in real_pub]
+    check("G4 โปรไฟล์ลับไม่หลุดออกฉบับสาธารณะเลยสักประโยค "
+          f"(ตรา 4 ประโยค + โปรไฟล์จริง {len(real_secrets)} ประโยค)",
+          not leaked and not guard_fired and news_ok and not real_leaked,
+          f"leaked={leaked} guard_fired={guard_fired} news_ok={news_ok} "
+          f"real_leaked={len(real_leaked)}")
+
+    # --- G5: the public digest --------------------------------------------
+    wl = [{"id": "w", "title": "เรื่องลับที่เกาะติด", "deadline": None,
+           "keywords": [], "note": "โน้ตลับของ watchlist"}]
+    items = [{"id": 1, "title": "พาดหัวสรุป", "level": "RED",
+              "topics": ["มอก."], "source_name": "ประชาชาติธุรกิจ",
+              "published_datetime": "2026-08-27T10:00:00",
+              "url": "https://x.test/s", "summary": "ย่อ."}]
+    pub_digest = summarizer.build_daily_summary(
+        items, wl, "ทดสอบ", health="ระบบปกติ · รอบนี้ตรวจข่าว 5 ชิ้น",
+        audience="public")
+    pub_empty = summarizer.build_daily_summary(
+        [], wl, "ทดสอบ", health="ระบบปกติ · รอบนี้ตรวจข่าว 0 ชิ้น",
+        audience="public")
+    full_digest = summarizer.build_daily_summary(items, wl, "ทดสอบ")
+    check("G5 สรุปฉบับสาธารณะ: ไม่มี watchlist ทั้งกรณีมีข่าวและไม่มีข่าว "
+          "แต่ยังมีหัวเรื่อง/พาดหัว/🩺 (ฉบับเต็มยังมี watchlist)",
+          "เรื่องที่เกาะติด (Watchlist)" not in pub_digest
+          and "เรื่องลับที่เกาะติด" not in pub_digest
+          and "เรื่องที่เกาะติด (Watchlist)" not in pub_empty
+          and "เรื่องลับที่เกาะติด" not in pub_empty
+          and "สรุปข่าวเหล็ก" in pub_digest and "พาดหัวสรุป" in pub_digest
+          and "🩺" in pub_digest and "🩺" in pub_empty
+          and "เรื่องที่เกาะติด (Watchlist)" in full_digest,
+          f"pub_has_wl={'Watchlist' in pub_digest} "
+          f"empty_has_wl={'Watchlist' in pub_empty}")
+
+    # --- G6/G7: realtime routing ------------------------------------------
+    m = make_matcher()
+    con = fresh_db()
+    storage.set_meta(con, "baseline_seeded", "1")
+    seed_news(con, 3)
+    con.close()
+    no_priv = run_realtime_as(m)
+    check("G6 ไม่มี ID ส่วนตัว -> broadcast 1 request เป็นฉบับสาธารณะ "
+          "(ทีมยังได้ข่าว)",
+          len(no_priv.calls) == 1 and pushed(no_priv) == ""
+          and "ข่าว 0" in broadcast(no_priv)
+          and "ผลกระทบต่อบริษัท" not in broadcast(no_priv),
+          f"calls={len(no_priv.calls)} push={len(pushed(no_priv))}")
+
+    con = fresh_db()
+    storage.set_meta(con, "baseline_seeded", "1")
+    seed_news(con, 3)
+    con.close()
+    priv = run_realtime_as(m, user_id=GOOD_ID)
+    check("G7 มี ID ส่วนตัว -> แจ้งเตือนด่วน push ฉบับเต็มถึงคนเดียว "
+          "ทีมไม่ได้รับ",
+          len(priv.calls) == 1 and broadcast(priv) == ""
+          and "💥 ผลกระทบต่อบริษัท" in pushed(priv)
+          and "กระทบสายผลิตเหล็กเส้นเตา IF" in pushed(priv),
+          f"calls={len(priv.calls)} broadcast={len(broadcast(priv))}")
+
+    # --- G8/G9: digest routing per round ----------------------------------
+    con = fresh_db()
+    storage.set_meta(con, "last_summary_at", "2000-01-01T00:00:00")
+    seed_news(con, 3)
+    con.close()
+    even = run_digest_as(m, user_id=GOOD_ID, round_hour=18)
+    con = storage.connect()
+    team_date = storage.get_meta(con, audience.TEAM_DIGEST_META)
+    priv_state = storage.get_meta(con, audience.PRIVATE_STATE_META)
+    priv_fp = storage.get_meta(con, audience.PRIVATE_FP_META)
+    con.close()
+    check("G8 สรุปรอบ 18:00 + มี ID -> 2 request (ส่วนตัวมี watchlist / "
+          "ทีม broadcast ไม่มี) และจดวันที่ส่งทีมไว้",
+          len(even.calls) == 2
+          and "เรื่องที่เกาะติด (Watchlist)" in pushed(even)
+          and "เรื่องที่เกาะติด (Watchlist)" not in broadcast(even)
+          and "สรุปข่าวเหล็ก" in broadcast(even)
+          and team_date == now_bkk().strftime("%Y-%m-%d")
+          and priv_state == "ok" and priv_fp == audience.fingerprint(GOOD_ID),
+          f"calls={len(even.calls)} team_date={team_date} "
+          f"state={priv_state} fp={priv_fp}")
+
+    con = fresh_db()
+    storage.set_meta(con, "last_summary_at", "2000-01-01T00:00:00")
+    seed_news(con, 3)
+    con.close()
+    morning = run_digest_as(m, user_id=GOOD_ID, round_hour=7)
+    con = storage.connect()
+    team_date_morning = storage.get_meta(con, audience.TEAM_DIGEST_META)
+    con.close()
+    check("G9 สรุปรอบ 07:00 + มี ID -> 1 request (เฉพาะส่วนตัว) ทีมยังไม่ได้รับ",
+          len(morning.calls) == 1 and broadcast(morning) == ""
+          and "สรุปข่าวเหล็ก" in pushed(morning) and team_date_morning is None,
+          f"calls={len(morning.calls)} team_date={team_date_morning}")
+
+    # --- G10: a malformed id must fail LOUDLY, not silently ---------------
+    con = fresh_db()
+    storage.set_meta(con, "baseline_seeded", "1")
+    seed_news(con, 3)
+    con.close()
+    errors = []
+    saved_error = audience.log.error
+    audience.log.error = lambda *a, **k: errors.append(a[0] if a else "")
+    try:
+        bad_id = run_realtime_as(m, user_id="Utest123")
+        state_bad = None
+        os.environ["LINE_USER_ID"] = "Utest123"
+        try:
+            state_bad = audience.private_user_id()[1]
+        finally:
+            os.environ.pop("LINE_USER_ID", None)
+    finally:
+        audience.log.error = saved_error
+    check("G10 ID ผิดรูปแบบ -> กลับไป broadcast อย่างเดียว + สถานะ invalid "
+          "+ log ERROR (ไม่เงียบหาย)",
+          len(bad_id.calls) == 1 and pushed(bad_id) == ""
+          and "ผลกระทบต่อบริษัท" not in broadcast(bad_id)
+          and state_bad == "invalid" and errors,
+          f"calls={len(bad_id.calls)} state={state_bad} errors={len(errors)}")
+
+    # --- G11: dead-man's switch reaches BOTH, and only one gets details ----
+    boom = RuntimeError("FATAL: (ENOTFOUND) tenant or user "
+                        "postgres.oxthmnbpzkzezrerkdhv not found")
+    broken = lambda *a, **k: (_ for _ in ()).throw(boom)  # noqa: E731
+    saved_connect = storage.connect
+    storage.connect = broken
+    raised = None
+    try:
+        dead = run_digest_as(m, user_id=GOOD_ID, round_hour=18)
+    except Exception as exc:  # noqa: BLE001
+        raised, dead = exc, None
+    finally:
+        storage.connect = saved_connect
+    pub_dead = broadcast(dead) if dead else ""
+    priv_dead = pushed(dead) if dead else ""
+    check("G11 DB ล่ม: ทั้งสองปลายทางได้รับแจ้ง · ฉบับสาธารณะไม่มี error ดิบ/"
+          "project ref · ไม่มี exception หลุด",
+          raised is None and dead is not None and len(dead.calls) == 2
+          and "ระบบเฝ้าข่าวขัดข้อง" in pub_dead
+          and "ข้อความนี้แปลว่า ระบบพัง ไม่ใช่ ไม่มีข่าว" in pub_dead
+          and "ระบบเฝ้าข่าวขัดข้อง" in priv_dead
+          and "oxthmnbpzkzezrerkdhv" not in pub_dead
+          and "ENOTFOUND" not in pub_dead and "tenant" not in pub_dead
+          and "ตรวจ 3 จุดตามลำดับ" not in pub_dead
+          and "ตรวจ 3 จุดตามลำดับ" in priv_dead
+          and "oxthmnbpzkzezrerkdhv" not in priv_dead,   # masked even in full
+          f"raised={raised!r} calls={len(dead.calls) if dead else 0}\n{pub_dead}")
+
+    # --- G12: the guard, layer 3 ------------------------------------------
+    with using_profile(SENTINEL_PROFILE):
+        blocks, leaks = audience.guard_public_blocks(
+            ["บล็อกปกติที่ไม่มีอะไรลับ", f"การ์ดที่มี {SENTINEL_NOTE} ปนเข้ามา"])
+        guarded_text = audience.guard_public_text(
+            "บรรทัดข่าวปกติ\n" + SENTINEL_WNOTE + "\nบรรทัดท้ายปกติ")
+    check("G12 ยามชั้นสาม: บล็อกที่มีประโยคภายในถูกแทนที่ + รายงาน leak "
+          "(บล็อกสะอาดไม่โดนแตะ)",
+          blocks[0] == "บล็อกปกติที่ไม่มีอะไรลับ"
+          and blocks[1] == audience.REDACTED_BLOCK and len(leaks) == 1
+          and SENTINEL_WNOTE not in guarded_text
+          and "บรรทัดข่าวปกติ" in guarded_text
+          and "บรรทัดท้ายปกติ" in guarded_text,
+          f"blocks={blocks} leaks={len(leaks)}")
+
+    # --- G13: error masking ----------------------------------------------
+    dsn = ("connection failed: postgresql://postgres.abcdefghijklmnop:"
+           "S3cretPassw0rd@aws-1-ap-southeast-1.pooler.supabase.com:5432/postgres")
+    masked = audience.mask_error(dsn)
+    tok = audience.mask_error("token AbCdEf0123456789AbCdEf0123456789zz expired")
+    mail = audience.mask_error("notify ops.team@example.com failed")
+    check("G13 mask_error ปิด DSN / project ref / token / อีเมล",
+          "S3cretPassw0rd" not in masked and "pooler.supabase.com" not in masked
+          and "abcdefghijklmnop" not in masked
+          and "AbCdEf0123456789AbCdEf0123456789zz" not in tok
+          and "ops.team@example.com" not in mail,
+          f"masked={masked} | tok={tok} | mail={mail}")
+
+    # --- G14: error categories carry no raw text -------------------------
+    cat_db = audience.classify_error(RuntimeError(
+        "FATAL: (ENOTFOUND) tenant or user postgres.oxthmnbpzkzezrerkdhv not found"))
+    cat_timeout = audience.classify_error(TimeoutError("statement timeout after 10s"))
+    cat_other = audience.classify_error(ValueError("something odd happened"))
+    check("G14 classify_error คืน 'หมวด' ล้วน ไม่มีข้อความ error ดิบติดมา",
+          "oxthmnbpzkzezrerkdhv" not in cat_db and "ENOTFOUND" not in cat_db
+          and "tenant" not in cat_db and "ฐานข้อมูล" in cat_db
+          and cat_timeout != cat_db and "10s" not in cat_timeout
+          and cat_other == "ระบบภายในขัดข้อง",
+          f"db={cat_db} timeout={cat_timeout} other={cat_other}")
+
+    # --- G15: destination id validation ----------------------------------
+    saved_uid = os.environ.pop("LINE_USER_ID", None)
+    try:
+        unset = audience.private_user_id()
+        os.environ["LINE_USER_ID"] = "Utest123"          # เหมือนที่ B3 ใช้
+        bad = audience.private_user_id()
+        os.environ["LINE_USER_ID"] = GOOD_ID
+        good = audience.private_user_id()
+        fp = audience.fingerprint(GOOD_ID)
+        check("G15 ตรวจรูปแบบ LINE_USER_ID: ว่าง/ผิดรูป/ถูกต้อง + ลายนิ้วมือ 8 ตัว",
+              unset == (None, "unset") and bad == (None, "invalid")
+              and good == (GOOD_ID, "ok") and len(fp) == 8
+              and fp == audience.fingerprint(GOOD_ID) and GOOD_ID not in fp,
+              f"unset={unset} bad={bad} good={good[1]} fp={fp}")
+    finally:
+        os.environ.pop("LINE_USER_ID", None)
+        if saved_uid is not None:
+            os.environ["LINE_USER_ID"] = saved_uid
+
+    # --- G16: which round the team gets ----------------------------------
+    st = dict(SETTINGS, team_digest_rounds=[18])
+    con = fresh_db()
+    on_round = audience.should_send_team_digest(con, st, 18)
+    off_round = audience.should_send_team_digest(con, st, 7)
+    catch_up = audience.should_send_team_digest(con, st, 21)   # รอบชดเชย
+    no_hour = audience.should_send_team_digest(con, st, None)
+    no_con = audience.should_send_team_digest(None, st, 18)
+    storage.set_meta(con, audience.TEAM_DIGEST_META,
+                     now_bkk().strftime("%Y-%m-%d"))
+    already = audience.should_send_team_digest(con, st, 18)
+    already_catch = audience.should_send_team_digest(con, st, 22)
+    con.close()
+    check("G16 รอบของทีม: ตรงรอบ=ส่ง · ก่อนรอบ=ไม่ส่ง · เลยรอบ=ชดเชย · "
+          "ส่งแล้ววันนี้=ไม่ส่งซ้ำ",
+          on_round and not off_round and catch_up and not no_hour and no_con
+          and not already and not already_catch,
+          f"on={on_round} off={off_round} catchup={catch_up} "
+          f"none={no_hour} nocon={no_con} already={already}/{already_catch}")
+
+    # --- G17: --preview-public is READ-ONLY ------------------------------
+    con = fresh_db()
+    storage.set_meta(con, "baseline_seeded", "1")
+    seed_news(con, 4)
+    con.close()
+    con = storage.connect()
+    meta_before = con.execute("SELECT key, value FROM meta ORDER BY key").fetchall()
+    alerted_before = n_alerted(con)
+    con.close()
+    buf = io.StringIO()
+    with line_channel() as preview_stub:
+        with contextlib.redirect_stdout(buf):
+            main.preview_public_cli(m, limit=4)
+    con = storage.connect()
+    meta_after = con.execute("SELECT key, value FROM meta ORDER BY key").fetchall()
+    alerted_after = n_alerted(con)
+    con.close()
+    out = buf.getvalue()
+    check("G17 --preview-public: ไม่ส่ง LINE · ไม่ mark alerted · ไม่แตะ meta "
+          "· รายงานผลสแกน leak",
+          len(preview_stub.calls) == 0 and alerted_before == alerted_after == 0
+          and meta_before == meta_after
+          and "ผลสแกน" in out and "ไม่มี" in out
+          and "ผลกระทบต่อบริษัท" not in out.split("ผลสแกน")[0],
+          f"calls={len(preview_stub.calls)} alerted={alerted_before}->"
+          f"{alerted_after} meta_same={meta_before == meta_after}")
+
+
+# =========================================================================
 
 def main_test():
     if hasattr(sys.stdout, "reconfigure"):
@@ -850,6 +1321,7 @@ def main_test():
         section_d()
         section_e()
         section_f()
+        section_g()
     finally:
         storage.connect = _real_connect
         shutil.rmtree(TMP_DIR, ignore_errors=True)

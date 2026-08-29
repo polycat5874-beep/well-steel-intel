@@ -5,6 +5,10 @@ Schedules (per approved spec):
   * realtime check every 15 minutes -> instant Telegram alert on critical news
   * daily summary at 07:00 / 12:00 / 18:00 (morning / noon / evening rounds)
 
+Two audiences (src/audience.py): the private destination gets the full message,
+the Official Account broadcast gets the same news without this operator's own
+reading of it.
+
 CLI:
   python main.py            run the scheduler (production mode)
   python main.py --once     run one fetch+alert cycle then exit (smoke test)
@@ -13,6 +17,9 @@ CLI:
   python main.py --quota-set-month N   backfill this month's request counter
   python main.py --cluster-report      read-only same-story duplicate audit
   python main.py --backfill-story-keys fill story_key for pre-existing rows
+  python main.py --audience            who receives what (sends nothing)
+  python main.py --verify-recipient    one test push to the private destination
+  python main.py --preview-public      show the team's version (sends nothing)
 """
 import argparse
 import json
@@ -26,11 +33,11 @@ from datetime import datetime, timedelta
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
-from src import storage, notifier, summarizer, quota, cluster  # noqa: E402
+from src import audience, storage, notifier, summarizer, quota, cluster  # noqa: E402
 from src.matcher import Matcher  # noqa: E402
 from src.sources import google_news, rss_feeds, gov_sites  # noqa: E402
 from src.sources.base import (  # noqa: E402
-    enrich_article, summarise_text, is_junk_title, is_fresh,
+    enrich_article, summarise_text, is_junk_title, is_fresh, now_bkk,
 )
 
 log = logging.getLogger("steel_intel")
@@ -155,6 +162,32 @@ def collect_cycle(matcher_obj):
     return len(items), n_new
 
 
+def build_alert_blocks(detailed, overflow, n_stories, aud):
+    """The blocks of one realtime push, rendered for ONE audience.
+
+    Index-compatible across audiences BY CONSTRUCTION: same header, same cards
+    in the same order, same optional tail. That is what lets `block_rows` be
+    built once and still line up with every destination's plan, which in turn is
+    what makes "mark alerted only what every destination carried" correct.
+
+    For the public audience the row is projected FIRST (audience.public_row), so
+    the renderer never even sees the internal fields.
+    """
+    blocks = [summarizer.build_alert_batch_header(n_stories, len(detailed))]
+    for i, story in enumerate(detailed, 1):
+        row = story["row"]
+        if aud == "public":
+            row = audience.public_row(row)
+        blocks.append(summarizer.build_critical_alert(
+            row, row, index=i, total=len(detailed), audience=aud))
+    if overflow:
+        rows = [s["row"] for s in overflow]
+        if aud == "public":
+            rows = audience.public_rows(rows)
+        blocks.append(summarizer.build_extra_headlines(rows))
+    return blocks
+
+
 def realtime_job(matcher_obj):
     """15-minute loop: collect then alert every unalerted critical item."""
     log.info("=== realtime job start ===")
@@ -244,32 +277,56 @@ def realtime_job(matcher_obj):
             log.warning("push budget spent; spending override push on %d %s stories",
                         len(top), "/".join(override_levels))
 
-        # Build self-contained blocks + the row ids each one accounts for, so
-        # only what actually went out gets marked alerted.
+        # Build the row ids each block accounts for, so only what actually went
+        # out gets marked alerted. Built ONCE: build_alert_blocks guarantees the
+        # same block layout for every audience.
         detailed, overflow = stories[:cap], stories[cap:]
-        blocks = [summarizer.build_alert_batch_header(len(stories), len(detailed))]
         block_rows = [[]]
-        for i, story in enumerate(detailed, 1):
-            row = story["row"]
-            blocks.append(summarizer.build_critical_alert(
-                row, row, index=i, total=len(detailed)))
+        for story in detailed:
             # ids, not [row["id"]]: a card speaks for its whole group, so every
             # row it covers must be marked alerted or the merged-away rows would
             # come back as "new" and be alerted again next cycle.
             block_rows.append(story["ids"])
         if overflow:
-            blocks.append(summarizer.build_extra_headlines(
-                [s["row"] for s in overflow]))
             block_rows.append([i for s in overflow for i in s["ids"]])
 
-        ok, used, covered = notifier.send_blocks(blocks, max_requests=1)
+        targets = audience.realtime_targets(matcher_obj.settings, con)
+        if not targets:  # cannot happen (team is the fallback) - but never guess
+            log.error("no alert destination resolved: nothing was sent")
+            return
+
+        ok_all, used_total, covered = True, 0, None
+        for target in targets:
+            blocks = build_alert_blocks(detailed, overflow, len(stories),
+                                        target["audience"])
+            if target["audience"] == "public":
+                blocks, leaks = audience.guard_public_blocks(blocks)
+                if leaks:
+                    log.error("realtime: %d block(s) redacted before broadcast",
+                              len(leaks))
+            ok, used, cov = notifier.send_blocks(blocks, max_requests=1,
+                                                 to=target["to"])
+            ok_all = ok and ok_all
+            used_total += used
+            # INTERSECTION, not union: a row is done only once EVERY destination
+            # has carried it. Marking on the union would let a block that fit on
+            # one channel but not another vanish from the channel that dropped
+            # it, permanently.
+            covered = cov if covered is None else (covered & cov)
+            log.info("realtime -> %s (%s): %d request(s), %d block(s) delivered",
+                     target["key"], target["audience"], used, len(cov))
+        covered = covered or set()
+
         # mark_alerted follows `covered`, NEVER `ok`: on dry-run (no credentials)
         # ok is always False, and gating on it would re-send the same news every
         # cycle forever. `covered` says what was actually put on the wire.
         sent_ids = [i for idx in sorted(covered) for i in block_rows[idx]]
         storage.mark_alerted(con, sent_ids)
+        # The unit stays the REQUEST, summed over destinations - LINE bills each
+        # destination its own request.
+        used = used_total
         quota.record(con, used, kind="realtime", override=is_override)
-        if not ok and used and notifier.active_channel() == "line":
+        if not ok_all and used and notifier.active_channel() == "line":
             log.warning("LINE reported a delivery failure for this alert batch")
         sent_set = set(sent_ids)
         n_stories = sum(1 for s in stories
@@ -281,8 +338,106 @@ def realtime_job(matcher_obj):
         con.close()
 
 
-def daily_summary_job(matcher_obj, round_label):
+def _digest_private(matcher_obj, targets, items, n_rows, round_label, health):
+    """Send the FULL digest to the private destination(s).
+
+    Returns (used_requests, ok, state) where state is what the public copy uses
+    to decide whether to add its "could not reach the operator" footnote.
+    """
+    used_total, any_ok = 0, False
+    state = audience.private_user_id()[1]      # "ok" | "unset" | "invalid"
+    for target in targets:
+        try:
+            msg = summarizer.build_daily_summary(
+                items, matcher_obj.cfg["watchlist"], round_label,
+                health=health, n_rows=n_rows,
+            )
+            ok, used = notifier.send_counted(msg, to=target["to"])
+            used_total += used
+            any_ok = any_ok or ok
+            if ok and used:
+                state = "ok"
+            elif notifier.active_channel() == "dry-run":
+                state = "dry-run"        # no credentials locally: not a failure
+            else:
+                state = "failed"
+            if used > 1:
+                log.warning("digest cost %d LINE requests - consider lowering "
+                            "LEVEL_SHOW_CAP['RED']", used)
+        except Exception as exc:  # noqa: BLE001 - one destination must not
+            log.error("digest to %s failed: %s", target["key"], exc)  # take out
+            state = "failed"                                          # the other
+    return used_total, any_ok, state
+
+
+def _digest_public(matcher_obj, targets, items, n_rows, round_label, health,
+                   private_state):
+    """Broadcast the PUBLIC digest. Returns (used_requests, ok).
+
+    The rows are projected before rendering and the finished text is scanned
+    once more (guard_public_text) - layers 1 and 3 of src/audience.py.
+    """
+    used_total, any_ok = 0, False
+    if private_state in ("failed", "invalid"):
+        # Say that the operator did NOT get their copy, without saying anything
+        # about the destination or the contents. Re-broadcasting the full digest
+        # instead would turn a delivery failure into a disclosure.
+        health = health + "\n⚠️ ส่งรายงานฉบับเต็มถึงผู้ดูแลไม่สำเร็จ — โปรดตรวจการตั้งค่าปลายทาง"
+    for target in targets:
+        try:
+            msg = summarizer.build_daily_summary(
+                audience.public_rows(items), matcher_obj.cfg["watchlist"],
+                round_label, health=health, n_rows=n_rows, audience="public",
+            )
+            msg = audience.guard_public_text(msg)
+            ok, used = notifier.send_counted(msg, to=target["to"])
+            used_total += used
+            any_ok = any_ok or ok
+            if used > 1:
+                log.warning("public digest cost %d LINE requests", used)
+        except Exception as exc:  # noqa: BLE001
+            log.error("digest to %s failed: %s", target["key"], exc)
+    return used_total, any_ok
+
+
+def _send_system_alert(matcher_obj, round_hour, round_label, exc, con):
+    """Dead-man's switch delivery: one message per destination, each isolated.
+
+    Returns the number of requests spent. If the audience machinery itself is
+    broken, a public fallback still goes out - the whole point of this switch is
+    that SOMETHING arrives.
+    """
+    try:
+        targets = audience.digest_targets(matcher_obj.settings, con, round_hour)
+    except Exception as texc:  # noqa: BLE001
+        log.error("cannot resolve destinations for the system alert: %s", texc)
+        targets = [{"key": "team", "to": notifier.BROADCAST, "audience": "public"}]
+
+    used_total = 0
+    for target in targets:
+        try:
+            if target["audience"] == "public":
+                msg = audience.guard_public_text(summarizer.build_system_alert(
+                    round_label, exc, audience="public"))
+            else:
+                msg = summarizer.build_system_alert(round_label, exc)
+        except Exception as mexc:  # noqa: BLE001
+            log.error("cannot build the system alert for %s: %s", target["key"], mexc)
+            msg = summarizer.SYSTEM_ALERT_PUBLIC_FALLBACK
+        try:
+            _ok, used = notifier.send_counted(msg, to=target["to"])
+            used_total += used
+        except Exception as sexc:  # noqa: BLE001
+            log.error("cannot deliver the system alert to %s: %s", target["key"], sexc)
+    return used_total
+
+
+def daily_summary_job(matcher_obj, round_label, round_hour=None):
     """07:00/12:00/18:00 rounds: summarize items stored since last round.
+
+    `round_hour` (the Bangkok hour of this round) decides whether the team also
+    gets a copy. It defaults to None - "not a scheduled round" - so any caller
+    that still passes two arguments keeps the private-only behaviour.
 
     This job doubles as the DEAD-MAN'S SWITCH. If collecting or the database
     fails, it says so on LINE instead of going quiet: from the reader's side
@@ -316,9 +471,15 @@ def daily_summary_job(matcher_obj, round_label):
         items = [s["row"] for s in
                  cluster.group_stories(items, matcher_obj.settings, label="digest")]
         if collect_error:
-            health = f"เก็บข่าวรอบนี้ล้มเหลว: {str(collect_error)[:120]}"
+            # Masked even on the private channel: an exception can carry the
+            # database DSN, and a digest is forwarded far more casually than a
+            # log file.
+            health = ("เก็บข่าวรอบนี้ล้มเหลว: "
+                      f"{audience.mask_error(str(collect_error))[:120]}")
+            health_public = "เก็บข่าวรอบนี้ล้มเหลว — ผู้ดูแลระบบได้รับรายละเอียดแล้ว"
         else:
             health = f"ระบบปกติ · รอบนี้ตรวจข่าว {stats[0]:,} ชิ้น"
+            health_public = health   # a healthy round reads the same for everyone
         # Quota warning rides ALONG WITH this digest (never as its own push -
         # that would burn the very quota it is warning about). The LINE GET
         # endpoints are authoritative and cost nothing.
@@ -330,29 +491,51 @@ def daily_summary_job(matcher_obj, round_label):
             warn = quota.pending_month_warning(
                 con, matcher_obj.settings, line_used=line_used, line_limit=line_limit)
             if warn:
-                health = health + "\n" + summarizer.build_quota_warning(warn)
+                notice = summarizer.build_quota_warning(warn)
+                health = health + "\n" + notice
+                health_public = health_public + "\n" + notice
         except Exception as exc:
             log.warning("quota warning check skipped: %s", exc)
-        msg = summarizer.build_daily_summary(
-            items, matcher_obj.cfg["watchlist"], round_label, health=health,
-            n_rows=n_rows,
-        )
-        ok, used = notifier.send_counted(msg)
+
+        targets = audience.digest_targets(matcher_obj.settings, con, round_hour)
+        private = [t for t in targets if t["audience"] == "full"]
+        public = [t for t in targets if t["audience"] == "public"]
+        # Private first: whether it got through decides what the public copy says.
+        used_private, ok_private, private_state = _digest_private(
+            matcher_obj, private, items, n_rows, round_label, health)
+        used_team, ok_team = _digest_public(
+            matcher_obj, public, items, n_rows, round_label, health_public,
+            private_state)
+        used = used_private + used_team
         quota.record(con, used, kind="summary")
-        if used > 1:
-            log.warning("digest cost %d LINE requests - consider lowering "
-                        "LEVEL_SHOW_CAP['RED']", used)
-        if warn and ok:
+        if warn and (ok_private or ok_team):
             quota.mark_month_warned(con)
+        # Tied to used_team, NOT to ok: on dry-run ok is always False, and
+        # gating on it would re-broadcast to the team on every later round of
+        # the same day (same reason mark_alerted follows `covered`).
+        if used_team > 0:
+            try:
+                storage.set_meta(con, audience.TEAM_DIGEST_META,
+                                 now_bkk().strftime("%Y-%m-%d"))
+            except Exception as exc:  # noqa: BLE001 - bookkeeping only
+                log.warning("cannot record the team digest date: %s", exc)
+        try:
+            storage.set_meta(con, audience.PRIVATE_STATE_META, private_state)
+            storage.set_meta(con, audience.PRIVATE_FP_META,
+                             audience.fingerprint(audience.private_user_id()[0]))
+        except Exception as exc:  # noqa: BLE001 - bookkeeping only
+            log.warning("cannot record the private destination state: %s", exc)
         storage.set_meta(
             con, "last_summary_at", datetime.now().isoformat(timespec="seconds")
         )
-        log.info("daily summary sent (%d items, %d LINE request(s))", len(items), used)
+        log.info("daily summary sent (%d items, %d LINE request(s): "
+                 "private=%d team=%d, private state=%s)",
+                 len(items), used, used_private, used_team, private_state)
     except Exception as exc:
         # The watcher itself is down (DB paused/unreachable, schema gone...).
         # Report it rather than letting the outage look like a quiet news day.
         log.error("daily summary failed: %s", exc)
-        ok, used = notifier.send_counted(summarizer.build_system_alert(round_label, exc))
+        used = _send_system_alert(matcher_obj, round_hour, round_label, exc, con)
         # Book it only if we still have a connection - and never let bookkeeping
         # throw over the top of the dead-man's switch.
         if con is not None:
@@ -378,6 +561,131 @@ def quota_cli(matcher_obj, set_month=None):
             print("(อ่านโควต้าจาก LINE API ไม่ได้ — ใช้ตัวนับในฐานข้อมูลแทน)")
         print(quota.report(con, matcher_obj.settings,
                            line_used=line_used, line_limit=line_limit))
+    finally:
+        con.close()
+
+
+def audience_cli(matcher_obj):
+    """--audience: who receives what, and at which level of detail.
+
+    READ-ONLY: sends nothing, writes nothing. Prints a FINGERPRINT of the
+    configured id, never the id itself - this output lands in terminals, logs
+    and screenshots.
+    """
+    con = None
+    try:
+        con = storage.connect()
+    except Exception as exc:  # noqa: BLE001 - the report works without a DB
+        log.warning("cannot open the database for the audience report: %s", exc)
+    try:
+        print(audience.mode_report(matcher_obj.settings, con))
+    finally:
+        if con is not None:
+            con.close()
+
+
+def verify_recipient_cli(matcher_obj):
+    """--verify-recipient: push ONE test message to the private destination.
+
+    A wrong id fails silently forever otherwise: LINE accepts the request and
+    nobody ever receives anything. This is the only way to find that out on
+    purpose rather than by noticing months of quiet.
+    """
+    uid, state = audience.private_user_id()
+    if not uid:
+        print("ยังไม่มีช่องส่วนตัวที่ใช้งานได้")
+        print("  สาเหตุ: " + ("LINE_USER_ID ผิดรูปแบบ "
+                              "(ต้องเป็น U/C/R ตามด้วยเลขฐาน 16 อีก 32 ตัว)"
+                              if state == "invalid" else "ยังไม่ได้ตั้ง LINE_USER_ID"))
+        print("  ตอนนี้ทุกข้อความออกทาง broadcast เป็นฉบับสาธารณะเท่านั้น")
+        return
+    msg = "\n".join([
+        "✅ ทดสอบปลายทางส่วนตัว (steel-intel)",
+        f"🗓 {summarizer.thai_date()}",
+        "",
+        "ถ้าอ่านข้อความนี้ได้ แปลว่าช่องส่วนตัวใช้งานได้จริง",
+        "รายงานฉบับเต็ม (ผลกระทบต่อบริษัท / คะแนน / watchlist) จะส่งมาทางนี้",
+        f"ลายนิ้วมือปลายทาง: {audience.fingerprint(uid)}",
+    ])
+    ok, used = notifier.send_counted(msg, to=uid)
+    channel = notifier.active_channel()
+    result = "ok" if (ok and used) else ("dry-run" if channel == "dry-run" else "failed")
+    try:
+        con = storage.connect()
+        try:
+            storage.set_meta(con, audience.PRIVATE_STATE_META, result)
+            storage.set_meta(con, audience.PRIVATE_FP_META, audience.fingerprint(uid))
+            quota.record(con, used, kind="other")
+        finally:
+            con.close()
+    except Exception as exc:  # noqa: BLE001 - the send already happened
+        log.warning("cannot record the verification result: %s", exc)
+    print(f"ช่องทาง: {channel} · ผล: {result} · ใช้ไป {used} request")
+    print(f"ลายนิ้วมือปลายทาง: {audience.fingerprint(uid)} (ไม่แสดง ID จริง)")
+    if result == "failed":
+        print("⚠️ ส่งไม่สำเร็จ — ตรวจว่า ID นี้แอด OA ไว้จริง และ token ยังใช้ได้")
+
+
+# Text that must NEVER appear in a public message. Used ONLY as a self-check in
+# the preview below - never to edit an outgoing message (see src/audience.py:
+# the news itself may legitimately contain any word).
+PUBLIC_FORBIDDEN_MARKERS = (
+    "ผลกระทบต่อบริษัท", "คะแนน", "คำสำคัญที่พบ", "⏳ เกาะติด",
+    "เรื่องที่เกาะติด (Watchlist)", "บทวิเคราะห์ AI",
+)
+
+
+def preview_public_cli(matcher_obj, limit=None):
+    """--preview-public: exactly what the team broadcast would look like.
+
+    READ-ONLY: sends nothing, marks nothing alerted, writes no meta key and
+    records no quota. Run it after touching anything in summarizer/audience.
+    """
+    con = storage.connect()
+    try:
+        rows = storage.get_since(con, "")          # every row, ORDER BY score
+        sample = rows[:(limit or 5)]
+        stories = cluster.group_stories(sample, matcher_obj.settings,
+                                        label="preview")
+        cap = matcher_obj.settings.get("alert_max_per_cycle", 8)
+        detailed, overflow = stories[:cap], stories[cap:]
+        blocks = build_alert_blocks(detailed, overflow, len(stories), "public")
+        guarded, block_leaks = audience.guard_public_blocks(blocks)
+
+        digest = summarizer.build_daily_summary(
+            audience.public_rows([s["row"] for s in stories]),
+            matcher_obj.cfg["watchlist"], "ตัวอย่าง",
+            health="ตัวอย่าง — ไม่ได้ส่งจริง", n_rows=len(sample),
+            audience="public",
+        )
+        digest_leaks = audience.find_leaks(digest)
+        digest = audience.guard_public_text(digest)
+
+        print("ตัวอย่างข้อความฉบับสาธารณะ (ที่ทีมงานจะได้รับ) — "
+              "อ่านอย่างเดียว ไม่ส่ง LINE ไม่แก้ฐานข้อมูล")
+        print("=" * 66)
+        print(f"แถวที่ใช้ทำตัวอย่าง : {len(sample):,} แถว -> {len(stories):,} เรื่อง")
+        print(f"ประโยคภายในที่ยามเฝ้าอยู่ : {len(audience.profile_secrets())} ประโยค")
+        print("")
+        print("--- แจ้งเตือนด่วน (ฉบับสาธารณะ) ---")
+        for block in guarded:
+            print(block)
+            print("")
+        print("--- สรุปรายวัน (ฉบับสาธารณะ) ---")
+        print(digest)
+
+        whole = "\n".join(guarded) + "\n" + digest
+        hits = [m for m in PUBLIC_FORBIDDEN_MARKERS if m in whole]
+        leaks = block_leaks + digest_leaks
+        print("")
+        print("=" * 66)
+        print("ผลสแกน")
+        print(f"  ประโยคภายในที่หลุดออกมา : {len(leaks)}"
+              + ("  ✅ ไม่มี" if not leaks else "  ❌ มี (ยามตัดออกให้แล้ว)"))
+        print(f"  หัวข้อภายในที่ไม่ควรมี   : "
+              + ("✅ ไม่พบ" if not hits else "❌ พบ -> " + ", ".join(hits)))
+        if leaks or hits:
+            print("  ⚠️ ต้องแก้ก่อนใช้งานจริง — ดู src/audience.py")
     finally:
         con.close()
 
@@ -498,7 +806,7 @@ def run_scheduler(matcher_obj):
     for hour, label in ROUND_LABELS.items():
         sched.add_job(
             daily_summary_job, "cron", hour=hour, minute=0,
-            args=[matcher_obj, label], id=f"summary_{hour}",
+            args=[matcher_obj, label, hour], id=f"summary_{hour}",
             misfire_grace_time=3600,
         )
     log.info("scheduler started: realtime/15min + summaries 07:00 12:00 18:00")
@@ -522,6 +830,12 @@ def main():
                         help="cluster-report: only audit the first N eligible rows")
     parser.add_argument("--backfill-story-keys", action="store_true",
                         help="fill story_key for rows stored before the column existed")
+    parser.add_argument("--audience", action="store_true",
+                        help="who receives what, at which detail (sends nothing)")
+    parser.add_argument("--verify-recipient", action="store_true",
+                        help="send one test message to the private destination")
+    parser.add_argument("--preview-public", action="store_true",
+                        help="print the team's version of the messages (sends nothing)")
     args = parser.parse_args()
 
     load_env()
@@ -532,14 +846,22 @@ def main():
         cluster_report_cli(matcher_obj, args.limit)
     elif args.backfill_story_keys:
         backfill_cli()
+    elif args.audience:
+        audience_cli(matcher_obj)
+    elif args.verify_recipient:
+        verify_recipient_cli(matcher_obj)
+    elif args.preview_public:
+        preview_public_cli(matcher_obj, args.limit)
     elif args.quota or args.quota_set_month is not None:
         quota_cli(matcher_obj, args.quota_set_month)
     elif args.once:
         realtime_job(matcher_obj)
     elif args.summary:
-        hour = datetime.now().hour
-        label = ROUND_LABELS.get(hour, f"พิเศษ {datetime.now():%H:%M}")
-        daily_summary_job(matcher_obj, label)
+        # Bangkok wall-clock, like every other round decision in this system:
+        # the GitHub runner is UTC and would pick the wrong round.
+        hour = now_bkk().hour
+        label = ROUND_LABELS.get(hour, f"พิเศษ {now_bkk():%H:%M}")
+        daily_summary_job(matcher_obj, label, hour)
     else:
         run_scheduler(matcher_obj)
 

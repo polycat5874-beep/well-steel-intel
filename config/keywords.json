@@ -324,6 +324,12 @@
       "เตาอาร์กไฟฟ้า",
       "กมอ."
     ],
-    "_priority_alert_note": "Critical keywords so central to this company's survival (TIS standards on rebar / IF furnaces, and anti-dumping measures) that a YELLOW item mentioning one still fires an instant alert instead of waiting for the daily digest. Everything else still needs RED/ORANGE. Rationale: the 2026-08-26 headline 'ขยับ 4 มอก. เป็นสินค้าควบคุม' scored exactly 4 (YELLOW) and would have been silently digested."
+    "_priority_alert_note": "Critical keywords so central to this company's survival (TIS standards on rebar / IF furnaces, and anti-dumping measures) that a YELLOW item mentioning one still fires an instant alert instead of waiting for the daily digest. Everything else still needs RED/ORANGE. Rationale: the 2026-08-26 headline 'ขยับ 4 มอก. เป็นสินค้าควบคุม' scored exactly 4 (YELLOW) and would have been silently digested.",
+    "team_digest_rounds": [
+      18
+    ],
+    "team_realtime_alerts": false,
+    "line_team_recipients": 2,
+    "_audience_note": "Who gets what (src/audience.py). The private channel (LINE_USER_ID push, or Telegram) receives the FULL version: impact notes, score, matched keywords and the watchlist. The OA broadcast receives the PUBLIC version: the same headlines, sources, times, links and 'also reported by' blocks, without this operator's reading of them. team_digest_rounds lists the hours whose daily digest is also broadcast to the team; a round later than the last hour in this list still sends if the team has not been served today (catch-up, because loop.yml hands over roughly every 5 hours and the 18:00 round can fall inside a handover). team_realtime_alerts=true additionally broadcasts instant alerts, which is off by default: realtime fires far more often and would eat the quota. Push arithmetic: LINE bills (requests x recipients) per destination, so a day with a private channel and one team round costs 3 private digests + 1 broadcast. line_team_recipients is how many people have added the OA - it is REPORTING ONLY (shown by `python main.py --audience`); the budget maths in src/quota.py stays on line_recipients."
   }
 }

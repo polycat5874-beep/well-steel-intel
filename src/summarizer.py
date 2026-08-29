@@ -10,12 +10,24 @@ Visual hierarchy (per approved spec):
     bullet summary / company-impact / link, wrapped in heavy dividers.
   * Daily summary  -> items grouped by level (RED/ORANGE/YELLOW), then by topic
     tag, separated with light dividers + watchlist countdown.
+
+AUDIENCE
+--------
+Every builder takes audience="full" (default, byte-for-byte the layout that
+shipped) or audience="public". The public variant is what goes out on the OA
+broadcast: same news, minus this operator's own reading of it - no impact notes,
+no score, no matched keywords, no watchlist. It is the SECOND of the three
+layers described in src/audience.py; the first is that a public builder is
+handed a row already projected down to the publicly showable fields, so an
+internal field it forgets to skip is not in the dict to begin with.
 """
 import logging
 import os
 from datetime import date, datetime
 
+from src.audience import classify_error, mask_error
 from src.cluster import normalize_title
+from src.matcher import load_profile_overlay
 from src.sources.base import split_sentences
 
 log = logging.getLogger("steel_intel.summarizer")
@@ -117,13 +129,18 @@ def _also_reported_lines(item, indent="   ", max_title=70):
 
 # --- critical alert ------------------------------------------------------
 
-def build_critical_alert(item, analysis, index=None, total=None):
+def build_critical_alert(item, analysis, index=None, total=None, audience="full"):
     """Premium realtime alert card (Thai) for one news item. `item` and
     `analysis` may be the same dict (a DB row already carries both).
 
     `index`/`total` number the card inside a batch ("2/8") so a reader can tell
     at a glance that several cards arrived in ONE push. Both omitted -> the
-    output is byte-for-byte the original single-card layout."""
+    output is byte-for-byte the original single-card layout.
+
+    audience="public" swaps the whole company-impact block for a plain
+    importance line. Everything a reader needs to act on the NEWS - headline,
+    date, source, the "also reported by" block, the summary and the link - is
+    identical in both versions; only the operator's own reading is withheld."""
     emoji = LEVEL_EMOJI.get(analysis.get("level"), "⚪")
     header = ("🚨 [CRITICAL ALERT]" if index is None or total is None
               else f"🚨 [CRITICAL ALERT {index}/{total}]")
@@ -149,14 +166,20 @@ def build_critical_alert(item, analysis, index=None, total=None):
     else:
         lines.append("   • (ดูรายละเอียดที่ลิงก์ข่าว)")
 
-    lines += ["", "💥 ผลกระทบต่อบริษัท (Impact)",
-              f"   {emoji} {analysis.get('level', '-')} · คะแนน {analysis.get('score', 0)}"]
-    if analysis.get("critical_hits"):
-        lines.append("   คำสำคัญที่พบ: " + ", ".join(analysis["critical_hits"][:6]))
-    for note in analysis.get("impact_notes", []):
-        lines.append(f"   • {note}")
-    for w in analysis.get("watchlist_hits", []):
-        lines.append(f"   ⏳ เกาะติด: {w}")
+    if audience == "public":
+        # LEVEL_LABEL has no "GRAY" key - .get keeps an unexpected level from
+        # taking the whole broadcast down with a KeyError.
+        lines += ["", "🔺 ระดับความสำคัญ",
+                  f"   {emoji} {LEVEL_LABEL.get(analysis.get('level'), '-')}"]
+    else:
+        lines += ["", "💥 ผลกระทบต่อบริษัท (Impact)",
+                  f"   {emoji} {analysis.get('level', '-')} · คะแนน {analysis.get('score', 0)}"]
+        if analysis.get("critical_hits"):
+            lines.append("   คำสำคัญที่พบ: " + ", ".join(analysis["critical_hits"][:6]))
+        for note in analysis.get("impact_notes", []):
+            lines.append(f"   • {note}")
+        for w in analysis.get("watchlist_hits", []):
+            lines.append(f"   ⏳ เกาะติด: {w}")
 
     if item.get("url"):
         lines += ["", "🔗 ลิงก์ข่าว", f"   {item['url']}"]
@@ -231,8 +254,11 @@ def build_watchlist_block(watchlist):
     return "\n".join(lines)
 
 
-def _render_level_block(level, rows):
-    """One level section: header + items grouped by topic tag."""
+def _render_level_block(level, rows, audience="full"):
+    """One level section: header + items grouped by topic tag.
+
+    audience="public" drops the "⚠️ impact note" line (the operator's own
+    reading); every headline, source, outlet list and link still shows."""
     parts = ["", f"{LEVEL_EMOJI[level]} {LEVEL_LABEL[level]} ({len(rows)})"]
     shown = rows[: LEVEL_SHOW_CAP[level]]
 
@@ -273,8 +299,9 @@ def _render_level_block(level, rows):
                         parts.append(f"   ↳ [{_src(other)}] {other_title}")
             for b in summary_bullets(it, max_points=1):
                 parts.append(f"   • {b}")
-            for note in it.get("impact_notes", [])[:1]:
-                parts.append(f"   ⚠️ {note}")
+            if audience != "public":
+                for note in it.get("impact_notes", [])[:1]:
+                    parts.append(f"   ⚠️ {note}")
             if it.get("url"):
                 parts.append(f"   🔗 {it['url']}")
             idx += 1
@@ -285,22 +312,52 @@ def _render_level_block(level, rows):
     return parts
 
 
-def build_system_alert(round_label, error):
+# Emitted when even the audience machinery fails while the dead-man's switch is
+# firing. It still carries the two lines that make the switch worth having, and
+# nothing that could conceivably be sensitive.
+SYSTEM_ALERT_PUBLIC_FALLBACK = "\n".join([
+    "🚨 ระบบเฝ้าข่าวขัดข้อง — ยังไม่ได้เฝ้าข่าวให้",
+    HEAVY_RULE,
+    "",
+    "ข้อความนี้แปลว่า ระบบพัง ไม่ใช่ ไม่มีข่าว",
+    "",
+    "โปรดแจ้งผู้ดูแลระบบให้ตรวจสอบโดยเร็ว",
+    HEAVY_RULE,
+])
+
+
+def build_system_alert(round_label, error, audience="full"):
     """Dead-man's switch: tell the reader the WATCHER is broken.
 
     From the reader's side a broken watcher and a quiet news day look identical -
     that is exactly how this system stayed silent for 16 days in Aug 2026. Only
     the daily-summary rounds send this (3x/day worst case); the realtime loop
     runs ~36x/day and would burn the whole LINE quota in under a week.
+
+    BOTH audiences keep the two lines the switch exists for - the alarm headline
+    and "this means the system is broken, not that there is no news". The public
+    version drops only the DIAGNOSIS: the raw error and the operator checklist
+    name infrastructure, so the team gets a category instead.
     """
-    return "\n".join([
+    head = [
         "🚨 ระบบเฝ้าข่าวขัดข้อง — ยังไม่ได้เฝ้าข่าวให้",
         f"🗓 {thai_date()}  |  รอบ{round_label}",
         HEAVY_RULE,
         "",
         "ข้อความนี้แปลว่า ระบบพัง ไม่ใช่ ไม่มีข่าว",
         "",
-        f"สาเหตุ: {str(error)[:300]}",
+    ]
+    if audience == "public":
+        return "\n".join(head + [
+            f"ประเภทปัญหา: {classify_error(error)}",
+            "",
+            "ผู้ดูแลระบบได้รับรายละเอียดฉบับเต็มแล้ว",
+            HEAVY_RULE,
+        ])
+    return "\n".join(head + [
+        # mask_error, never the raw string: a DSN or an access token inside an
+        # exception would otherwise be pasted straight into a chat window.
+        f"สาเหตุ: {mask_error(str(error))[:300]}",
         "",
         "ตรวจ 3 จุดตามลำดับ:",
         "1) Supabase ถูก pause หรือไม่ (free tier พักโปรเจคเมื่อไม่มี query 7 วัน)",
@@ -310,14 +367,21 @@ def build_system_alert(round_label, error):
     ])
 
 
-def build_daily_summary(items, watchlist, round_label, health=None, n_rows=None):
+def build_daily_summary(items, watchlist, round_label, health=None, n_rows=None,
+                        audience="full"):
     """Daily summary message (Thai), grouped RED/ORANGE/YELLOW -> topic + watchlist.
 
     `n_rows` is how many DATABASE ROWS the `items` stand for once same-story rows
     have been merged (see cluster.group_stories). Left as None - or equal to
     len(items) - the header keeps its original wording exactly; otherwise it
     states both numbers, so a shrinking headline count reads as "merged", never
-    as "the watcher found less news"."""
+    as "the watcher found less news".
+
+    audience="public" omits the watchlist block entirely (a list of what this
+    company is afraid of, and dated - it would be the single most revealing
+    thing in the message) and the AI analysis paragraph, which is written from
+    the company's point of view. The header, the news itself and the "🩺" proof
+    of life stay, so a broadcast still proves the watcher ran."""
     count = f"ข่าวใหม่ {len(items)} ชิ้น"
     if n_rows is not None and n_rows != len(items):
         count = f"ข่าวใหม่ {len(items)} เรื่อง (จาก {n_rows} ชิ้น)"
@@ -329,10 +393,13 @@ def build_daily_summary(items, watchlist, round_label, health=None, n_rows=None)
     # Proof-of-life appended to the footer: a digest saying "no news" then
     # also proves the watcher ran, at no extra push cost.
     footer = [f"🩺 {health}"] if health else []
+    is_public = audience == "public"
     if not items:
         body = ["", "ไม่มีข่าวใหม่ที่เกี่ยวข้องในรอบนี้", "", LIGHT_RULE, ""]
-        return "\n".join(header + body + [build_watchlist_block(watchlist)]
-                         + footer + [HEAVY_RULE])
+        # The quiet-day digest hides the watchlist too: "no news" is exactly the
+        # message where the watchlist would be the only content worth reading.
+        tail = [] if is_public else [build_watchlist_block(watchlist)]
+        return "\n".join(header + body + tail + footer + [HEAVY_RULE])
 
     groups = {"RED": [], "ORANGE": [], "YELLOW": []}
     for it in items:
@@ -348,17 +415,39 @@ def build_daily_summary(items, watchlist, round_label, health=None, n_rows=None)
         if not first:
             parts.append(LIGHT_RULE)
         first = False
-        parts += _render_level_block(level, rows)
+        parts += _render_level_block(level, rows, audience=audience)
 
-    parts += ["", LIGHT_RULE, build_watchlist_block(watchlist)]
-
-    ai_text = ai_deep_summary(groups["RED"] + groups["ORANGE"])
-    if ai_text:
-        parts += ["", LIGHT_RULE, "🤖 บทวิเคราะห์ AI:", ai_text]
+    if not is_public:
+        parts += ["", LIGHT_RULE, build_watchlist_block(watchlist)]
+        ai_text = ai_deep_summary(groups["RED"] + groups["ORANGE"])
+        if ai_text:
+            parts += ["", LIGHT_RULE, "🤖 บทวิเคราะห์ AI:", ai_text]
 
     parts += footer
     parts.append(HEAVY_RULE)
     return "\n".join(parts)
+
+
+# Neutral by design. The persona that names the company, its furnace type and
+# its raw-material mix is operator data and lives in the profile overlay
+# (config/profile.json / STEEL_INTEL_PROFILE_JSON), never in this public repo.
+DEFAULT_AI_PERSONA = "คุณเป็นนักวิเคราะห์อุตสาหกรรมเหล็กเส้นในประเทศไทย"
+
+
+def _ai_persona():
+    """The analyst persona for the AI paragraph, from the profile overlay.
+
+    Read straight off load_profile_overlay() rather than through
+    matcher.PROFILE_KEYS on purpose: adding a key there would feed it into
+    scoring, and this string must not move a single score."""
+    try:
+        overlay, _source = load_profile_overlay()
+        persona = (overlay.get("ai_persona") or "").strip()
+        if persona:
+            return persona
+    except Exception as exc:  # noqa: BLE001 - the AI paragraph is optional
+        log.warning("cannot read ai_persona from the profile: %s", exc)
+    return DEFAULT_AI_PERSONA
 
 
 def ai_deep_summary(items, max_items=10):
@@ -377,8 +466,7 @@ def ai_deep_summary(items, max_items=10):
             for it in items[:max_items]
         )
         prompt = (
-            "คุณเป็นนักวิเคราะห์อุตสาหกรรมเหล็กเส้นในประเทศไทย "
-            " "
+            _ai_persona() + " "
             "สรุปนัยสำคัญของพาดหัวข่าววันนี้ต่อบริษัท ใน 3-5 บรรทัด ภาษาไทย "
             "เน้นสิ่งที่ผู้บริหารควรทำ:\n" + headlines
         )
