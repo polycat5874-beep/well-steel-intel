@@ -20,6 +20,11 @@ WHAT IS BEING PROVEN
     G. audience        the team broadcast carries the news and NOTHING from the
                        operator profile, the private channel keeps the full
                        reading, and a malformed destination fails loudly.
+    H. archive         the public back-catalogue site carries the news and
+                       nothing else: no secret field survives the projection, a
+                       whole site built under the sentinel profile is clean, no
+                       row is ever hidden, and the build refuses to run when the
+                       leak guard would be blind.
 
 SAFETY: this file never touches the real Supabase DB, never sends to LINE, and
 never fetches news (collect_cycle is stubbed).
@@ -1307,6 +1312,655 @@ def section_g():
 
 
 # =========================================================================
+# H. the public archive: a site anyone on the internet can read
+# =========================================================================
+
+# The archive is built for a PUBLIC GitHub Pages host, so the question these
+# checks answer is not "does it look right" but "can a stranger learn anything
+# about this company from it". H3 is the headline evidence: a whole site built
+# while the sentinel profile is loaded, with every page searched for every
+# sentinel sentence.
+
+SETTINGS_ARCHIVE = dict(
+    SETTINGS,
+    cluster_enabled=True,          # the archive groups same-day duplicates
+    archive_enabled=True,
+    archive_index_max_kb=900,
+    archive_include_level=True,
+)
+
+_SITE_N = [0]
+
+
+def arch_settings(**overrides):
+    out = dict(SETTINGS_ARCHIVE)
+    out.update(overrides)
+    return out
+
+
+def out_dir():
+    """A directory that does NOT exist yet, so 'no file was written' is
+    testable rather than assumed."""
+    _SITE_N[0] += 1
+    return os.path.join(TMP_DIR, "site%d" % _SITE_N[0])
+
+
+def site_files(outdir):
+    """Relative paths of everything actually on disk under outdir."""
+    found = []
+    for root, _dirs, names in os.walk(outdir):
+        for name in names:
+            full = os.path.join(root, name)
+            found.append(os.path.relpath(full, outdir).replace("\\", "/"))
+    return sorted(found)
+
+
+def read_site(outdir):
+    out = {}
+    for rel in site_files(outdir):
+        with open(os.path.join(outdir, *rel.split("/")), encoding="utf-8") as fh:
+            out[rel] = fh.read()
+    return out
+
+
+def html_pages(files):
+    return {p: t for p, t in files.items() if p.endswith(".html")}
+
+
+def seed_archive(con, specs):
+    """Rows for the archive checks.
+
+    Unlike seed_real_news, a spec may deliberately omit the publication time
+    (`when=None`) - the government listings really do arrive without one, and
+    the archive has to fall back to fetched_at and SAY that it did."""
+    default = now_bkk().strftime("%Y-%m-%dT%H:%M:%S")
+    pairs = []
+    for i, spec in enumerate(specs):
+        when = spec.get("when", default) or ""
+        item = {
+            "title": spec["title"],
+            "url": spec.get("url", f"https://example.test/arc/{i}"),
+            "source": spec.get("outlet", "ทดสอบ"),
+            "source_name": spec.get("outlet", "ประชาชาติธุรกิจ"),
+            "published": when,
+            "published_datetime": when,
+            "summary": spec.get("summary", "เนื้อหาย่อสำหรับตรวจคลังข่าวย้อนหลัง."),
+        }
+        analysis = {
+            "topics": spec.get("topics", ["มาตรฐาน มอก."]),
+            "critical_hits": ["มอก."],
+            "score": spec.get("score", 12),
+            "level": spec.get("level", "RED"),
+            "impact_notes": spec.get("notes", []),
+            "watchlist_hits": spec.get("watch", []),
+        }
+        pairs.append((item, analysis))
+    storage.insert_many(con, pairs)
+
+
+class no_profile:
+    """No operator profile from ANY source.
+
+    using_profile(None) only clears the environment variable; on a developer
+    machine config/profile.json still exists and would be picked up, so the
+    file path is redirected too. Without this, 'the guard is unarmed' cannot be
+    tested at all on the machine where it matters most."""
+
+    def __enter__(self):
+        from src import matcher as matcher_mod
+        self._mod = matcher_mod
+        self._saved_path = matcher_mod.PROFILE_PATH
+        self._saved_env = os.environ.get("STEEL_INTEL_PROFILE_JSON")
+        matcher_mod.PROFILE_PATH = os.path.join(TMP_DIR, "no-such-profile.json")
+        os.environ.pop("STEEL_INTEL_PROFILE_JSON", None)
+        audience.reset_cache()
+        return self
+
+    def __exit__(self, *exc):
+        self._mod.PROFILE_PATH = self._saved_path
+        if self._saved_env is not None:
+            os.environ["STEEL_INTEL_PROFILE_JSON"] = self._saved_env
+        audience.reset_cache()
+        return False
+
+
+def real_profile_sentences():
+    """Long strings out of the REAL config/profile.json, as a deny-list.
+
+    Keyword lists are skipped on purpose: profile keywords are words like
+    "เตา IF" and "มอก." which appear in real headlines for entirely innocent
+    reasons (the same reasoning as src/audience.py). Everything else - notes,
+    titles, names, addresses - must never show up in a published page."""
+    from src.matcher import PROFILE_PATH
+    if not os.path.exists(PROFILE_PATH):
+        return None
+    with open(PROFILE_PATH, encoding="utf-8") as fh:
+        data = json.load(fh)
+    found = []
+
+    def walk(node, key=""):
+        if isinstance(node, str):
+            if key != "keywords" and len(node.strip()) >= audience.MIN_SECRET_LEN:
+                found.append(node.strip())
+        elif isinstance(node, dict):
+            for k, v in node.items():
+                walk(v, k)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v, key)
+
+    walk(data)
+    return found
+
+
+def section_h():
+    print("\n--- H. คลังข่าวย้อนหลัง (archive) ---")
+    from src import archive
+
+    # --- H1: the allow-list itself ---------------------------------------
+    secret_fields = {"score", "hash", "critical_hits", "impact_notes",
+                     "watchlist_hits", "alerted", "story_key"}
+    check("H1 ฟิลด์ที่ขึ้นคลัง เป็นสับเซตของฉบับสาธารณะ และไม่มีฟิลด์ลับแม้ตัวเดียว",
+          archive.ARCHIVE_FIELDS <= audience.PUBLIC_ROW_FIELDS
+          and not (archive.ARCHIVE_FIELDS & secret_fields),
+          f"archive={sorted(archive.ARCHIVE_FIELDS)}")
+
+    # --- H2: encode() cannot carry a secret through -----------------------
+    con = fresh_db()
+    seed_secret_news(con, 3)          # rows whose analysis holds the sentinels
+    keys_in_db = [row[0] for row in
+                  con.execute("SELECT story_key FROM news").fetchall()]
+    rows = archive.rows_for_archive(con)
+    con.close()
+    doc = archive.encode(rows, SETTINGS_ARCHIVE)
+    payload = archive.payload_json(doc)
+    # ...and a hand-made row that carries every secret field explicitly, in case
+    # a future storage change starts handing extra keys to the archive.
+    dirty = dict(rows[0], score=99, impact_notes=[SENTINEL_NOTE],
+                 watchlist_hits=[SENTINEL_WATCH], critical_hits=["มอก."],
+                 story_key="deadbeefdeadbeef", hash="cafebabe", alerted=1)
+    dirty_payload = archive.payload_json(archive.encode([dirty], SETTINGS_ARCHIVE))
+    both = payload + dirty_payload
+    check("H2 encode: ไม่มีชื่อฟิลด์ลับ ไม่มีค่าลับ (โน้ต/watchlist/story_key) "
+          "ในเพย์โหลด",
+          not any(t in both for t in archive.FORBIDDEN_TOKENS)
+          and not any(s in both for s in SENTINELS)
+          and not any(k and k in both for k in keys_in_db)
+          and "deadbeefdeadbeef" not in dirty_payload
+          and "cafebabe" not in dirty_payload,
+          f"rows={len(rows)}")
+
+    # --- H3: THE evidence - a whole site built with the sentinel loaded ----
+    outdir3 = out_dir()
+    with using_profile(SENTINEL_PROFILE):
+        con = fresh_db()
+        seed_secret_news(con, 3)
+        seed_archive(con, [
+            {"title": "สมอ. ทบทวนมาตรฐานเหล็กเส้น รอบใหม่",
+             "when": "2026-08-27T10:05:00", "outlet": "ประชาชาติธุรกิจ"},
+            {"title": "ศุลกากรจับเหล็กสำแดงเท็จ 200 ตัน",
+             "when": "2026-07-02T08:30:00", "outlet": "กรุงเทพธุรกิจ"},
+        ])
+        stats3 = archive.build_site(con, SETTINGS_ARCHIVE, outdir3,
+                                    require_guard=True, min_rows=1)
+        con.close()
+        files3 = read_site(outdir3)
+        pages3 = html_pages(files3)
+        sentinel_hits = [(p, s[:14]) for p, t in pages3.items()
+                         for s in SENTINELS if s in t]
+        guard_hits = [(p, len(audience.find_leaks(t))) for p, t in pages3.items()
+                      if audience.find_leaks(t)]
+    check("H3 สร้างคลังทั้งไซต์ใต้โปรไฟล์ตราลับ -> ไม่มีประโยคภายในในหน้าใดเลย "
+          "(หลักฐานหลัก)",
+          bool(pages3) and not sentinel_hits and not guard_hits
+          and stats3["rows"] == 5 and stats3["leaks"] == 0,
+          f"pages={len(pages3)} sentinel={sentinel_hits} guard={guard_hits} "
+          f"stats={ {k: stats3[k] for k in ('rows', 'pages', 'index_rows')} }")
+
+    # --- H4: no raw row was ever dumped -----------------------------------
+    token_hits = [(p, t) for p, text in files3.items()
+                  for t in archive.FORBIDDEN_TOKENS if t in text]
+    check("H4 ทุกหน้าไม่มีคำต้องห้าม (impact_notes/critical_hits/watchlist_hits/"
+          "story_key/alerted/score/hash)",
+          not token_hits, f"hits={token_hits}")
+
+    # --- H5: the REAL profile, not the sentinel ---------------------------
+    deny = real_profile_sentences()
+    if deny is None:
+        print("[SKIP] H5 ไม่มี config/profile.json ในเครื่องนี้ "
+              "(ตรวจไม่ได้ ไม่ใช่ผ่าน)")
+    else:
+        real_hits = [(p, len(s)) for p, t in pages3.items() for s in deny if s in t]
+        check(f"H5 ประโยคจริงจาก config/profile.json ({len(deny)} ประโยค) "
+              "ไม่โผล่ในหน้าใดเลย", not real_hits, f"hits={real_hits}")
+
+    # --- H6: an unarmed guard must stop the build, not bless it -----------
+    outdir6 = out_dir()
+    con = fresh_db()
+    seed_archive(con, [{"title": "ข่าวทดสอบยามไม่ติดอาวุธ"}])
+    raised6, secrets6 = None, None
+    with no_profile():
+        secrets6 = len(audience.profile_secrets())
+        try:
+            archive.build_site(con, SETTINGS_ARCHIVE, outdir6,
+                               require_guard=True, min_rows=1)
+        except Exception as exc:            # noqa: BLE001 - any refusal is fine
+            raised6 = exc
+    con.close()
+    check("H6 require_guard=True แต่ไม่มีโปรไฟล์ -> ปฏิเสธการสร้าง และไม่เขียนไฟล์",
+          raised6 is not None and secrets6 == 0 and site_files(outdir6) == [],
+          f"raised={raised6!r} secrets={secrets6} files={site_files(outdir6)}")
+
+    # --- H7: building the archive must change nothing else -----------------
+    outdir7 = out_dir()
+    con = fresh_db()
+    storage.set_meta(con, "baseline_seeded", "1")
+    seed_archive(con, [{"title": "ข่าวคลัง A"}, {"title": "ข่าวคลัง B"},
+                       {"title": "ข่าวคลัง C"}])
+    first_id = db_rows(con)[0][0]
+    storage.mark_alerted(con, [first_id])
+    meta_before = con.execute("SELECT key, value FROM meta ORDER BY key").fetchall()
+    alerted_before = n_alerted(con)
+    con.close()
+    con = storage.connect()
+    with line_channel() as arch_stub:
+        stats7 = archive.build_site(con, SETTINGS_ARCHIVE, outdir7, min_rows=1)
+    meta_after = con.execute("SELECT key, value FROM meta ORDER BY key").fetchall()
+    alerted_after = n_alerted(con)
+    con.close()
+    check("H7 สร้างคลังเต็มรอบ: ไม่ยิง LINE · alerted เท่าเดิม · meta ไม่เปลี่ยน",
+          len(arch_stub.calls) == 0 and alerted_before == alerted_after == 1
+          and meta_before == meta_after and stats7["rows"] == 3,
+          f"calls={len(arch_stub.calls)} alerted={alerted_before}->{alerted_after} "
+          f"meta_same={meta_before == meta_after}")
+
+    # --- H8: a headline is not markup, and a link is not code -------------
+    outdir8 = out_dir()
+    con = fresh_db()
+    seed_archive(con, [
+        {"title": "</script><script>alert(1)</script>",
+         "url": "javascript:alert(1)", "when": "2026-08-20T09:00:00"},
+        {"title": "ข่าวปกติคู่กัน", "when": "2026-08-20T08:00:00"},
+    ])
+    archive.build_site(con, SETTINGS_ARCHIVE, outdir8, min_rows=1)
+    con.close()
+    page8 = read_site(outdir8)["index.html"]
+    tag = '<script id="d" type="application/json">'
+    block8 = page8.split(tag, 1)[1].split("</script>", 1)[0]
+    try:
+        parsed8 = json.loads(block8)
+        titles8 = [r[1] for r in parsed8["rows"]]
+    except ValueError as exc:
+        parsed8, titles8 = None, [repr(exc)]
+    check("H8 พาดหัวที่มี </script> และลิงก์ javascript: -> บล็อกข้อมูลไม่ถูกปิดกลางคัน "
+          "และไม่มี href=javascript:",
+          parsed8 is not None and "</script><script>alert(1)</script>" in titles8
+          and 'href="javascript:' not in page8
+          and "&lt;/script&gt;" in page8
+          and page8.count(tag) == 1,
+          f"titles={titles8}")
+
+    # --- H9: an empty archive must never overwrite a good one -------------
+    outdir9 = out_dir()
+    con = fresh_db()
+    raised9 = None
+    try:
+        archive.build_site(con, SETTINGS_ARCHIVE, outdir9, min_rows=1)
+    except Exception as exc:                # noqa: BLE001
+        raised9 = exc
+    con.close()
+    check("H9 ตารางว่าง -> ปฏิเสธการสร้าง และไม่มีไฟล์ถูกเขียน",
+          raised9 is not None and site_files(outdir9) == [],
+          f"raised={raised9!r} files={site_files(outdir9)}")
+
+    # --- H10: the off switch is silent, not fatal -------------------------
+    outdir10 = out_dir()
+    con = fresh_db()
+    seed_archive(con, [{"title": "ข่าวที่จะไม่ถูกสร้างเป็นคลัง"}])
+    raised10, stats10 = None, None
+    try:
+        stats10 = archive.build_site(con, arch_settings(archive_enabled=False),
+                                     outdir10, min_rows=1)
+    except Exception as exc:                # noqa: BLE001
+        raised10 = exc
+    con.close()
+    check("H10 archive_enabled=false -> ข้ามเงียบๆ ไม่ raise และไม่มีไฟล์",
+          raised10 is None and (stats10 or {}).get("skipped") is True
+          and site_files(outdir10) == [],
+          f"raised={raised10!r} stats={stats10} files={site_files(outdir10)}")
+
+    # --- H11: the index is a shortcut, never the only copy ----------------
+    con = fresh_db()
+    seed_archive(con, [
+        {"title": f"ข่าวคลังลำดับที่ {i} เรื่องมาตรฐานเหล็กเส้นและการนำเข้า",
+         "when": f"2026-0{(i % 3) + 4}-1{i % 9}T0{i % 9}:00:00",
+         "url": f"https://example.test/cap/{i}"}
+        for i in range(40)])
+    small = arch_settings(archive_index_max_kb=4)
+    rows11 = archive._group_by_day(archive.rows_for_archive(con), small)
+    pages11 = archive.pages(rows11, small)
+    con.close()
+    all_ids = {r["id"] for r in rows11}
+    index_ids = {r["id"] for r in pages11[0]["rows"]}
+    union_ids = {r["id"] for p in pages11[1:] for r in p["rows"]}
+    check("H11 เพดานหน้าแรกเล็ก -> หน้าแรกไม่ครบ แต่รวมทุกหน้าไตรมาสแล้วครบทุกแถว",
+          len(all_ids) == 40 and 0 < len(index_ids) < len(all_ids)
+          and union_ids == all_ids,
+          f"all={len(all_ids)} index={len(index_ids)} union={len(union_ids)}")
+
+    # --- H12: the quarter boundary ---------------------------------------
+    con = fresh_db()
+    seed_archive(con, [
+        {"title": "ข่าวปลายไตรมาสสอง", "when": "2026-06-30T23:59:00"},
+        {"title": "ข่าวต้นไตรมาสสาม", "when": "2026-07-01T00:01:00"},
+    ])
+    rows12 = archive._group_by_day(archive.rows_for_archive(con),
+                                   SETTINGS_ARCHIVE)
+    pages12 = archive.pages(rows12, SETTINGS_ARCHIVE)
+    con.close()
+    paths12 = {p["path"]: [r["title"] for r in p["rows"]] for p in pages12[1:]}
+    check("H12 30/06/2026 -> Q2 · 01/07/2026 -> Q3 (ทั้งฟังก์ชันและหน้าไตรมาสจริง)",
+          archive.quarter_key("2026-06-30T23:59") == "2026-Q2"
+          and archive.quarter_key("2026-07-01T00:01") == "2026-Q3"
+          and paths12.get("q/2026-Q2.html") == ["ข่าวปลายไตรมาสสอง"]
+          and paths12.get("q/2026-Q3.html") == ["ข่าวต้นไตรมาสสาม"],
+          f"paths={paths12}")
+
+    # --- H13: a missing publication time is admitted, not faked -----------
+    con = fresh_db()
+    seed_archive(con, [{"title": "ข่าวไม่มีวันที่แต่มีเวลาเก็บ", "when": None},
+                       {"title": "ข่าวมีวันที่ครบ", "when": "2026-08-11T07:00:00"}])
+    rows13 = archive.rows_for_archive(con)
+    pages13 = archive.pages(archive._group_by_day(rows13, SETTINGS_ARCHIVE),
+                            SETTINGS_ARCHIVE)
+    con.close()
+    by_title = {r["title"]: r for r in rows13}
+    fallback = by_title.get("ข่าวไม่มีวันที่แต่มีเวลาเก็บ", {})
+    dated = by_title.get("ข่าวมีวันที่ครบ", {})
+    on_a_page = {r["id"] for p in pages13[1:] for r in p["rows"]}
+
+    # A row with NO usable time at all. It cannot be produced through the table:
+    # storage.get_since filters `fetched_at > ''`, so a row with an empty
+    # fetched_at is invisible to the query in the first place - and a NULL in
+    # either column (what a half-finished migration leaves behind) reaches the
+    # code as None, which is where a naive [:16] would blow up. Fed straight to
+    # the real function through a stand-in cursor.
+    def raw_row(**vals):
+        base = {col: "" for col in storage.ROW_COLS}
+        base.update({"id": 1, "score": 0, "alerted": 0, "topics": "[]",
+                     "critical_hits": "[]", "impact_notes": "[]",
+                     "watchlist_hits": "[]"})
+        base.update(vals)
+        return tuple(base[col] for col in storage.ROW_COLS)
+
+    class _StubCursor:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchall(self):
+            return self._rows
+
+    class _StubCon:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def execute(self, _sql, _params=()):
+            return _StubCursor(self._rows)
+
+    raised13 = None
+    try:
+        timeless = archive.rows_for_archive(_StubCon([
+            raw_row(id=91, title="ไม่มีเวลาเลยสักอย่าง",
+                    published_datetime=None, fetched_at=None),
+            raw_row(id=92, title="ว่างเปล่าทั้งสองช่อง",
+                    published_datetime="", fetched_at=""),
+        ]))
+        pages_timeless = archive.pages(
+            archive._group_by_day(timeless, SETTINGS_ARCHIVE), SETTINGS_ARCHIVE)
+    except Exception as exc:                # noqa: BLE001
+        raised13, timeless, pages_timeless = exc, [], []
+    undated_ids = {r["id"] for p in pages_timeless[1:]
+                   if p["key"] == archive.UNDATED for r in p["rows"]}
+
+    check("H13 ไม่มี published_datetime -> ใช้เวลาที่เก็บ + ติดธง · ไม่มีเวลาเลย -> "
+          "ไม่พัง และยังมีหน้าให้อยู่",
+          fallback.get("df") == 1 and fallback.get("disp")
+          and dated.get("df") == 0 and dated.get("disp") == "2026-08-11T07:00"
+          and on_a_page == {r["id"] for r in rows13}
+          and raised13 is None and len(timeless) == 2
+          and all(r["disp"] == "" and r["df"] == 0 for r in timeless)
+          and undated_ids == {91, 92},
+          f"raised={raised13!r} fallback={fallback.get('disp')!r} "
+          f"timeless={[(r['id'], r['disp'], r['df']) for r in timeless]} "
+          f"undated={undated_ids}")
+
+    # --- H14: same story, one group number, and still three rows ----------
+    con = fresh_db()
+    same = "สมอ. ถอนอายัดเหล็ก ซิน เคอ หยวน 6.6 หมื่นเส้น ชี้ผลสอบได้มาตรฐาน"
+    seed_archive(con, [
+        {"title": same, "when": "2026-08-25T09:00:00", "outlet": "ประชาชาติธุรกิจ",
+         "url": "https://example.test/g/1"},
+        {"title": same, "when": "2026-08-25T10:00:00", "outlet": "มติชนออนไลน์",
+         "url": "https://example.test/g/2"},
+        {"title": same, "when": "2026-08-25T11:00:00", "outlet": "ท็อปนิวส์",
+         "url": "https://example.test/g/3"},
+        {"title": "ข่าวคนละเรื่องวันเดียวกัน ศุลกากรจับตู้สินค้า",
+         "when": "2026-08-25T12:00:00", "outlet": "กรุงเทพธุรกิจ",
+         "url": "https://example.test/g/4"},
+    ])
+    rows14 = archive._group_by_day(archive.rows_for_archive(con), SETTINGS_ARCHIVE)
+    con.close()
+    groups14 = {r["title"]: r["g"] for r in rows14}
+    same_gs = [r["g"] for r in rows14 if r["title"] == same]
+    check("H14 พาดหัวเดียวกัน 3 สำนัก วันเดียวกัน -> g เดียวกัน แต่ยังอยู่ครบ 3 แถว "
+          "(กฎห้ามซ่อน)",
+          len(rows14) == 4 and len(same_gs) == 3 and len(set(same_gs)) == 1
+          and groups14["ข่าวคนละเรื่องวันเดียวกัน ศุลกากรจับตู้สินค้า"] != same_gs[0],
+          f"gs={same_gs} all={sorted(groups14.values())}")
+
+    # --- H15: the compact tables decode back to the original --------------
+    con = fresh_db()
+    seed_archive(con, [
+        {"title": "ข่าวกูเกิลนิวส์", "outlet": "ฐานเศรษฐกิจ",
+         "url": "https://news.google.com/rss/articles/CBMiabc123",
+         "topics": ["มาตรฐาน มอก."], "when": "2026-08-24T09:00:00"},
+        {"title": "ข่าวลิงก์ธรรมดา", "outlet": "กรุงเทพธุรกิจ",
+         "url": "https://www.bangkokbiznews.com/news/1",
+         "topics": ["นำเข้า/ส่งออก", "มาตรฐาน มอก."], "when": "2026-08-23T09:00:00"},
+        {"title": "ข่าวลิงก์ http", "outlet": "กรมโรงงานอุตสาหกรรม",
+         "url": "http://www.diw.go.th/news/2",
+         "topics": [], "when": "2026-08-22T09:00:00"},
+    ])
+    rows15 = archive.rows_for_archive(con)
+    con.close()
+    doc15 = archive.encode(rows15, SETTINGS_ARCHIVE)
+    ok15 = len(rows15) == 3
+    for src_row, enc in zip(rows15, doc15["rows"]):
+        url = (doc15["pre"][enc[2]] + enc[3]) if enc[2] >= 0 else enc[3]
+        ok15 = ok15 and url == src_row["url"]
+        ok15 = ok15 and doc15["src"][enc[4]] == src_row["source_name"]
+        ok15 = ok15 and [doc15["top"][i] for i in enc[9]] == list(src_row["topics"])
+    check("H15 ดัชนี pre/src/top ถอดกลับได้ตรงต้นฉบับทุกแถว (round-trip)", ok15,
+          f"pre={doc15['pre']} src={doc15['src']} top={doc15['top']}")
+
+    # --- H16: publishing the news without the reading of it ---------------
+    outdir16 = out_dir()
+    con = fresh_db()
+    seed_archive(con, [{"title": "ข่าวไม่ระบุระดับความสำคัญ", "level": "RED"},
+                       {"title": "ข่าวอีกชิ้นไม่ระบุระดับ", "level": "ORANGE"}])
+    no_level = arch_settings(archive_include_level=False)
+    stats16 = archive.build_site(con, no_level, outdir16, min_rows=1)
+    con.close()
+    files16 = read_site(outdir16)
+    page16 = files16["index.html"]
+    doc16 = json.loads(page16.split(tag, 1)[1].split("</script>", 1)[0])
+    check("H16 archive_include_level=false -> เพย์โหลดไม่มีระดับความสำคัญ "
+          "และหน้ายังสร้างได้ปกติ",
+          stats16["rows"] == 2 and doc16["lv"] == 0
+          and all(r[8] == "" for r in doc16["rows"])
+          and "🔴" not in page16 and "🟠" not in page16,
+          f"lv={doc16['lv']} levels={[r[8] for r in doc16['rows']]}")
+
+    # --- H17: not for search engines ---------------------------------------
+    robots_meta = [p for p, t in pages3.items()
+                   if '<meta name="robots" content="noindex' not in t]
+    check("H17 ทุกหน้ามี meta robots noindex + มี robots.txt ที่ Disallow: /",
+          not robots_meta and "robots.txt" in files3
+          and "Disallow: /" in files3["robots.txt"]
+          and ".nojekyll" in files3,
+          f"missing_meta={robots_meta} files={sorted(files3)}")
+
+    # --- H18: offline means offline ---------------------------------------
+    external = []
+    for path, text in pages3.items():
+        low = text.lower()
+        for marker in ("<script src", "<link ", "<img", "<iframe",
+                       "@import", "url(http", "://fonts."):
+            if marker in low:
+                external.append((path, marker))
+    check("H18 ไม่มีไฟล์ภายนอกเลย (ไม่มี script src / link / img / @import / CDN)",
+          not external, f"external={external}")
+
+    # --- H19: the digest links to the archive, at no extra push cost ------
+    # The archive is worthless if nobody can find it, and a separate "here is
+    # the link" message would cost a LINE request every day out of a ~150/month
+    # budget. So the link rides inside the digest that is already going out -
+    # and while archive_url is empty the message must not change by one byte.
+
+    def seed19(con):
+        """Fixed content AND a fixed publication time: the two digests are
+        compared character by character, so nothing may drift between runs."""
+        stamp = now_bkk().strftime("%Y-%m-%d") + "T09:15:00"
+        pairs = []
+        for i in range(3):
+            pairs.append(({
+                "title": f"ข่าวทดสอบลิงก์คลัง {i} สมอ. ทบทวนมาตรฐานเหล็กเส้น",
+                "url": f"https://example.test/arc-link/{i}",
+                "source": "ทดสอบ",
+                "source_name": "ประชาชาติธุรกิจ",
+                "published": stamp,
+                "published_datetime": stamp,
+                "summary": "เนื้อหาย่อคงที่สำหรับเทียบข้อความสองรอบ.",
+            }, {
+                "topics": ["มาตรฐาน มอก."],
+                "critical_hits": ["มอก."],
+                "score": 12,
+                "level": "RED",
+                "impact_notes": [],
+                "watchlist_hits": [],
+            }))
+        storage.insert_many(con, pairs)
+
+    def digest19(**over):
+        con = fresh_db()
+        seed19(con)
+        con.close()
+        stub = run_digest_as(make_matcher(**over))
+        return broadcast(stub), len(stub.calls)
+
+    plain19, calls19 = digest19()
+    linked19, calls19b = digest19(archive_url="https://example.test/steel/")
+    link19 = "📚 คลังข่าวย้อนหลัง: https://example.test/steel/"
+    stripped19 = linked19.replace("\n" + link19, "")
+    check("H19 archive_url ว่าง -> ข้อความเท่าเดิมเป๊ะ · ตั้งค่าแล้ว -> เพิ่มบรรทัด"
+          "ลิงก์คลัง 1 บรรทัด และจำนวน request เท่าเดิม",
+          link19 not in plain19 and linked19.count(link19) == 1
+          and stripped19 == plain19
+          and linked19.count("\n") == plain19.count("\n") + 1
+          and calls19 == calls19b == 1,
+          f"calls={calls19}/{calls19b} เท่ากันหลังถอดบรรทัด="
+          f"{stripped19 == plain19}")
+
+    # --- H20: the front page stays inside its budget ----------------------
+    outdir20 = out_dir()
+    con = fresh_db()
+    seed_archive(con, [
+        {"title": f"ข่าวทดสอบเพดานขนาดหน้าแรก ลำดับที่ {i} "
+                  "เรื่องมาตรการตอบโต้การทุ่มตลาดเหล็กนำเข้า",
+         "when": f"2026-05-2{i % 9}T0{i % 9}:30:00",
+         "url": f"https://example.test/size/{i}"}
+        for i in range(60)])
+    capped = arch_settings(archive_index_max_kb=8)
+    stats20 = archive.build_site(con, capped, outdir20, min_rows=1)
+    con.close()
+    limit20 = 8 * 1024 * 1.15
+    check("H20 ขนาดข้อมูลหน้าแรกที่สร้างจริง <= เพดาน x 1.15",
+          stats20["index_bytes"] <= limit20
+          and stats20["index_rows"] < stats20["rows"] == 60,
+          f"index={stats20['index_bytes']}B limit={limit20:.0f}B "
+          f"rows={stats20['index_rows']}/{stats20['rows']}")
+
+    # --- H21: the news is shipped ONCE, as data ---------------------------
+    # The first version of the archive rendered every headline into HTML next to
+    # the very same headline inside the embedded JSON: index.html came out at
+    # 1.14 MB with 62% of it duplicated text no reader ever saw twice. The page
+    # shell (stylesheet + script + fallback) is a FIXED cost, so this is measured
+    # on a realistically sized archive - on two rows any shell looks enormous.
+    outdir21 = out_dir()
+    con = fresh_db()
+    marker21 = "ข่าวหลักฐานว่าหน้าเว็บไม่ได้เรนเดอร์รายการล่วงหน้าเอาไว้ซ้ำอีกชุด"
+    specs21 = [{"title": marker21, "when": "2026-01-05T08:00:00",
+                "url": "https://example.test/once/0",
+                "summary": "แถวเก่าที่สุด จึงไม่อยู่ในบล็อกสำรองของหน้าเว็บ"}]
+    for i in range(500):
+        specs21.append({
+            "title": "ข่าวคลังชุดวัดขนาดลำดับที่ %d เรื่องมาตรการตอบโต้การทุ่มตลาด"
+                     "เหล็กนำเข้าและการทบทวนมาตรฐานผลิตภัณฑ์เหล็กเส้นเสริมคอนกรีต"
+                     % i,
+            "when": "2026-%02d-%02dT%02d:%02d:00"
+                    % (4 + (i % 6), 1 + (i % 28), i % 24, i % 60),
+            "url": "https://example.test/bulk/%d" % i,
+            "outlet": ["ประชาชาติธุรกิจ", "กรุงเทพธุรกิจ", "ฐานเศรษฐกิจ"][i % 3],
+            "summary": "เนื้อหาย่อสำหรับวัดขนาดไฟล์จริงของหน้าเว็บคลังข่าว "
+                       "ชิ้นที่ %d ในชุดทดสอบ" % i,
+        })
+    seed_archive(con, specs21)
+    stats21 = archive.build_site(con, SETTINGS_ARCHIVE, outdir21, min_rows=1)
+    con.close()
+    page21 = read_site(outdir21)["index.html"]
+    body21 = page21.split(tag, 1)[1].split("</script>", 1)[0]
+    file21 = len(page21.encode("utf-8"))
+    pay21 = len(body21.encode("utf-8"))
+    ns21 = page21.count('class="nsitem"')
+    check("H21 หน้าแรกไม่มีรายการข่าวที่เรนเดอร์ล่วงหน้า: ขนาดไฟล์ <= เพย์โหลด x 1.4 "
+          "และพาดหัวนอกบล็อกสำรองปรากฏในไฟล์ครั้งเดียว",
+          stats21["index_rows"] == 501 and file21 <= pay21 * 1.4
+          and ns21 <= archive.NOSCRIPT_ROWS and page21.count(marker21) == 1,
+          f"file={file21}B payload={pay21}B ratio={file21 / max(1, pay21):.2f} "
+          f"fallback={ns21} marker={page21.count(marker21)}")
+
+    # --- H22: the page reads its news from the JSON block, not from markup --
+    js22 = archive.asset("app.js")
+    check("H22 หน้าเว็บมีบล็อกข้อมูล JSON ก้อนเดียว และสคริปต์อ่านรายการจากบล็อกนั้น "
+          "(getElementById + JSON.parse)",
+          page21.count(tag) == 1
+          and "getElementById" in js22 and "JSON.parse" in js22
+          and "getElementById" in page21 and "JSON.parse" in page21,
+          f"tags={page21.count(tag)} js={len(js22)}B")
+
+    # --- H23: the front-end sources themselves are clean -------------------
+    # Not just the built pages: a class or variable named after an internal
+    # column is how a raw row starts leaking in the first place, and the name
+    # would be shipped inside every page from then on.
+    banned23 = set(archive.FORBIDDEN_TOKENS) | {
+        "impact_notes", "critical_hits", "watchlist_hits", "story_key",
+        "alerted", "score", "hash"}
+    web23, hits23 = {}, []
+    for name23 in sorted(os.listdir(archive.WEB_DIR)):
+        full23 = os.path.join(archive.WEB_DIR, name23)
+        if not os.path.isfile(full23):
+            continue
+        with open(full23, encoding="utf-8") as fh:
+            web23[name23] = fh.read()
+        for word23 in sorted(banned23):
+            if word23 in web23[name23]:
+                hits23.append((name23, word23))
+    check("H23 ไฟล์ใน web/ ทุกไฟล์ไม่มีชื่อฟิลด์ภายในเลยแม้ในคอมเมนต์",
+          bool(web23) and not hits23,
+          f"files={sorted(web23)} hits={hits23}")
+
+
+# =========================================================================
 
 def main_test():
     if hasattr(sys.stdout, "reconfigure"):
@@ -1322,6 +1976,7 @@ def main_test():
         section_e()
         section_f()
         section_g()
+        section_h()
     finally:
         storage.connect = _real_connect
         shutil.rmtree(TMP_DIR, ignore_errors=True)

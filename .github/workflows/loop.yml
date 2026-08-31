@@ -73,3 +73,11 @@ jobs:
             sleep $(( 600 - elapsed ))
           fi
           gh workflow run loop.yml --repo "$GITHUB_REPOSITORY"
+
+      # After the handoff, never before it: a failure here must not be able to
+      # break the chain that keeps the watcher alive.
+      - name: Refresh the public archive
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run archive.yml --repo "$GITHUB_REPOSITORY" || true

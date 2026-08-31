@@ -330,6 +330,11 @@
     ],
     "team_realtime_alerts": false,
     "line_team_recipients": 2,
+    "archive_enabled": true,
+    "archive_index_max_kb": 900,
+    "archive_include_level": true,
+    "archive_url": "",
+    "_archive_note": "The public back-catalogue site (src/archive.py, built by `python main.py --build-archive`). It is meant to sit on GitHub Pages in a PUBLIC repository, so every page is built from audience.public_rows() ONLY - the headline, source, time, link, level and topics - and never from impact notes, score, matched keywords or the watchlist. Each page is rendered in memory and audited (profile sentences + forbidden field names) BEFORE anything is written; one hit aborts the whole build and no file is written at all. archive_index_max_kb caps the payload embedded in the FRONT PAGE only: older news is not dropped, it stays on its quarter page, which always holds every row (the index is a shortcut, never the only copy). archive_include_level=false publishes the news without the RED/ORANGE/YELLOW reading of it. archive_url is the public address of the built site: while it is EMPTY the digest does not change by a single byte - nothing links to the archive until this is filled in deliberately.",
     "_audience_note": "Who gets what (src/audience.py). The private channel (LINE_USER_ID push, or Telegram) receives the FULL version: impact notes, score, matched keywords and the watchlist. The OA broadcast receives the PUBLIC version: the same headlines, sources, times, links and 'also reported by' blocks, without this operator's reading of them. team_digest_rounds lists the hours whose daily digest is also broadcast to the team; a round later than the last hour in this list still sends if the team has not been served today (catch-up, because loop.yml hands over roughly every 5 hours and the 18:00 round can fall inside a handover). team_realtime_alerts=true additionally broadcasts instant alerts, which is off by default: realtime fires far more often and would eat the quota. Push arithmetic: LINE bills (requests x recipients) per destination, so a day with a private channel and one team round costs 3 private digests + 1 broadcast. line_team_recipients is how many people have added the OA - it is REPORTING ONLY (shown by `python main.py --audience`); the budget maths in src/quota.py stays on line_recipients."
   }
 }

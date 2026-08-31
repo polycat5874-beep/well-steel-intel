@@ -20,6 +20,9 @@ CLI:
   python main.py --audience            who receives what (sends nothing)
   python main.py --verify-recipient    one test push to the private destination
   python main.py --preview-public      show the team's version (sends nothing)
+  python main.py --build-archive       build the public back-catalogue site
+                                       (read-only; --out DIR --require-guard
+                                        --min-rows N)
 """
 import argparse
 import json
@@ -33,7 +36,9 @@ from datetime import datetime, timedelta
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
-from src import audience, storage, notifier, summarizer, quota, cluster  # noqa: E402
+from src import (  # noqa: E402
+    archive, audience, storage, notifier, summarizer, quota, cluster,
+)
 from src.matcher import Matcher  # noqa: E402
 from src.sources import google_news, rss_feeds, gov_sites  # noqa: E402
 from src.sources.base import (  # noqa: E402
@@ -43,6 +48,9 @@ from src.sources.base import (  # noqa: E402
 log = logging.getLogger("steel_intel")
 
 SOURCES_PATH = os.path.join(BASE_DIR, "config", "sources.json")
+# Where --build-archive writes the public back-catalogue. Kept relative to this
+# file (never a hard-coded drive letter) so it works on the runner too.
+ARCHIVE_DIR = os.path.join(BASE_DIR, "site")
 ROUND_LABELS = {7: "เช้า 07:00", 12: "เที่ยง 12:00", 18: "เย็น 18:00"}
 
 # Article enrichment (extra HTTP round-trip per item) is gated to high-impact
@@ -480,6 +488,13 @@ def daily_summary_job(matcher_obj, round_label, round_hour=None):
         else:
             health = f"ระบบปกติ · รอบนี้ตรวจข่าว {stats[0]:,} ชิ้น"
             health_public = health   # a healthy round reads the same for everyone
+        # Rides along inside the digest that is already being sent - zero extra
+        # LINE requests. Empty setting = the message stays exactly as it was.
+        archive_url = (matcher_obj.settings.get("archive_url") or "").strip()
+        if archive_url:
+            line = "📚 คลังข่าวย้อนหลัง: " + archive_url
+            health = health + "\n" + line
+            health_public = health_public + "\n" + line
         # Quota warning rides ALONG WITH this digest (never as its own push -
         # that would burn the very quota it is warning about). The LINE GET
         # endpoints are authoritative and cost nothing.
@@ -784,6 +799,59 @@ def cluster_report_cli(matcher_obj, limit=None):
         con.close()
 
 
+def build_archive_cli(matcher_obj, outdir=None, require_guard=False, min_rows=1):
+    """--build-archive: write the public back-catalogue site.
+
+    READ-ONLY towards the system, exactly like --preview-public: it sends
+    nothing, marks nothing alerted, writes no meta key, records no quota and
+    never runs the story_key backfill. The ONLY thing it writes is the site
+    directory.
+
+    The site is built for a PUBLIC GitHub Pages host, so every page comes out of
+    audience.public_rows() and is audited before a single file is written (see
+    src/archive.py). A leak aborts the whole build rather than shipping a
+    partly-clean site.
+    """
+    outdir = outdir or ARCHIVE_DIR
+    con = storage.connect()
+    try:
+        stats = archive.build_site(
+            con, matcher_obj.settings, outdir,
+            require_guard=require_guard, min_rows=max(1, int(min_rows or 1)),
+        )
+    except (ValueError, RuntimeError) as exc:
+        print("❌ " + str(exc))
+        sys.exit(1)
+    finally:
+        con.close()
+
+    print("สร้างคลังข่าวย้อนหลัง (อ่านอย่างเดียว ไม่ส่ง LINE ไม่แก้ฐานข้อมูล)")
+    print("=" * 66)
+    if stats.get("skipped"):
+        print("  ปิดการสร้างคลังไว้ (archive_enabled=false) — ไม่ได้เขียนไฟล์ใดเลย")
+        return
+    quarters = " · ".join(f"{key} {n:,}" for key, n in stats["quarters"]) or "-"
+    print(f"  แถวที่ขึ้นคลัง            : {stats['rows']:,} แถว"
+          f" ({stats['groups']:,} เรื่อง)")
+    print(f"  ช่วงวันที่               : {stats['first']} ถึง {stats['last']}")
+    print(f"  จำนวนหน้า                : {stats['pages']:,} หน้า"
+          f" (หน้าแรก + ไตรมาส {len(stats['quarters'])})")
+    print(f"  ไตรมาส                  : {quarters}")
+    print(f"  หน้าแรกบรรจุ             : {stats['index_rows']:,} แถว"
+          f" · ข้อมูล {stats['index_bytes'] / 1024:.1f} KB")
+    print(f"  ขนาดรวมทั้งคลัง           : {stats['bytes'] / 1024:.1f} KB"
+          f" ({len(stats['files'])} ไฟล์)")
+    print(f"  โฟลเดอร์ปลายทาง           : {stats['outdir']}")
+    print("")
+    print("ผลสแกนก่อนเขียนไฟล์")
+    print(f"  ประโยคภายในที่ยามเฝ้าอยู่ : {stats['secrets']} ประโยค"
+          + ("" if stats["secrets"] else
+             "  ⚠️ ไม่มีโปรไฟล์ = ยามไม่ได้ตรวจอะไรเลย (ใช้ --require-guard)"))
+    print(f"  ข้อมูลภายในที่หลุด : {stats['leaks']} ✅")
+    print("  หมายเหตุ: ทุกหน้าถูกตรวจในหน่วยความจำก่อน ถ้าพบแม้จุดเดียว"
+          "จะไม่มีไฟล์ใดถูกเขียน")
+
+
 def backfill_cli():
     """--backfill-story-keys: force the story_key backfill to run again."""
     con = storage.connect()
@@ -836,6 +904,15 @@ def main():
                         help="send one test message to the private destination")
     parser.add_argument("--preview-public", action="store_true",
                         help="print the team's version of the messages (sends nothing)")
+    parser.add_argument("--build-archive", action="store_true",
+                        help="build the public back-catalogue site (sends nothing)")
+    parser.add_argument("--out", metavar="DIR",
+                        help="build-archive: output directory (default: ./site)")
+    parser.add_argument("--require-guard", action="store_true",
+                        help="build-archive: refuse to build when no operator "
+                             "profile is loaded (the leak guard would be blind)")
+    parser.add_argument("--min-rows", type=int, metavar="N", default=1,
+                        help="build-archive: refuse to build with fewer rows than N")
     args = parser.parse_args()
 
     load_env()
@@ -852,6 +929,9 @@ def main():
         verify_recipient_cli(matcher_obj)
     elif args.preview_public:
         preview_public_cli(matcher_obj, args.limit)
+    elif args.build_archive:
+        build_archive_cli(matcher_obj, args.out, args.require_guard,
+                          args.min_rows)
     elif args.quota or args.quota_set_month is not None:
         quota_cli(matcher_obj, args.quota_set_month)
     elif args.once:

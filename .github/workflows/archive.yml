@@ -1,0 +1,60 @@
+name: steel-intel archive
+
+# Rebuilds the public news archive and publishes it to GitHub Pages.
+#
+# The page carries ONLY audience.public_rows() output - headlines, outlet, time,
+# link, severity, topic - never this operator's reading of them. src/archive.py
+# renders every page in memory, scans each one against the profile's authored
+# sentences, and refuses to write anything at all if one shows up.
+on:
+  schedule:
+    - cron: "20 1 * * *"    # 08:20 Asia/Bangkok - after the 07:00 digest
+    - cron: "20 12 * * *"   # 19:20 Asia/Bangkok - after the 18:00 digest
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# MUST NOT be steel-intel-run: loop.yml holds that group for ~5h at a stretch
+# and every other run queued on it is cancelled - the archive would silently
+# never rebuild.
+concurrency:
+  group: steel-intel-archive
+  cancel-in-progress: true
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    env:
+      TZ: Asia/Bangkok
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      # Required: without the profile the leak guard has nothing to match on,
+      # so --require-guard fails the build rather than publishing unchecked.
+      STEEL_INTEL_PROFILE_JSON: ${{ secrets.STEEL_INTEL_PROFILE_JSON }}
+      # Deliberately NOT passed: LINE_* and ANTHROPIC_API_KEY. This job sends
+      # nothing, so it has no business holding those credentials.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      - name: Build the archive
+        run: python main.py --build-archive --out site --require-guard --min-rows 1
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      # No `if: always()` on purpose: a failed build must leave the previous
+      # site up rather than replace it with something broken.
+      - id: deploy
+        uses: actions/deploy-pages@v4
