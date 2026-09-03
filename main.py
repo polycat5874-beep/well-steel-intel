@@ -20,6 +20,8 @@ CLI:
   python main.py --audience            who receives what (sends nothing)
   python main.py --verify-recipient    one test push to the private destination
   python main.py --preview-public      show the team's version (sends nothing)
+  python main.py --playbook            what to DO about the current top news
+                                       (full version, sends nothing; --limit N)
   python main.py --build-archive       build the public back-catalogue site
                                        (read-only; --out DIR --require-guard
                                         --min-rows N)
@@ -647,6 +649,10 @@ def verify_recipient_cli(matcher_obj):
 PUBLIC_FORBIDDEN_MARKERS = (
     "ผลกระทบต่อบริษัท", "คะแนน", "คำสำคัญที่พบ", "⏳ เกาะติด",
     "เรื่องที่เกาะติด (Watchlist)", "บทวิเคราะห์ AI",
+    # The playbook headings (src/playbook.py). An action names this operator's
+    # licences and obligations, so seeing either of these in a public message
+    # means the audience split failed upstream.
+    summarizer.ACTION_HEAD, "🎯 ทำต่อ:",
 )
 
 
@@ -701,6 +707,61 @@ def preview_public_cli(matcher_obj, limit=None):
               + ("✅ ไม่พบ" if not hits else "❌ พบ -> " + ", ".join(hits)))
         if leaks or hits:
             print("  ⚠️ ต้องแก้ก่อนใช้งานจริง — ดู src/audience.py")
+    finally:
+        con.close()
+
+
+def playbook_cli(matcher_obj, limit=None):
+    """--playbook: the FULL version - what to do about the current top news.
+
+    READ-ONLY: sends nothing, marks nothing alerted, writes no meta key and
+    records no quota. This is the mirror image of --preview-public: that one
+    proves the team sees no internal reading, this one shows the reading and
+    the instructions that go with it.
+
+    It prints operator-internal text to the terminal on purpose, which is why
+    it opens with a warning: the actions name which licences this plant runs
+    under, and a screenshot of this output is a leak.
+    """
+    from src import playbook
+
+    con = storage.connect()
+    try:
+        rows = storage.get_since(con, "")          # every row, ORDER BY score
+        sample = rows[:(limit or 8)]
+        pb = playbook.stats()
+        _uid, state = audience.private_user_id()
+
+        print("⚠️ ฉบับเต็ม (มีข้อมูลภายใน) — อย่าแคปหน้าจอนี้ส่งต่อ")
+        print("=" * 66)
+        print(f"  คู่มือสิ่งที่ต้องทำ       : {pb['with_action']}/{pb['groups']} "
+              f"กลุ่มความเสี่ยงมี action (โปรไฟล์: {pb['source']})")
+        print(f"  ช่องส่วนตัว (ฉบับเต็ม)   : "
+              + {"ok": "ตั้งค่าแล้ว", "unset": "ยังไม่ได้ตั้ง LINE_USER_ID",
+                 "invalid": "⚠️ LINE_USER_ID ผิดรูปแบบ"}[state])
+        print(f"  แถวที่นำมาแสดง            : {len(sample):,} จาก {len(rows):,} แถว")
+        if state != "ok":
+            print("ℹ️ ยังไม่ได้ตั้ง LINE_USER_ID → ข้อความเหล่านี้ถูกสร้างแล้ว"
+                  "แต่ยังไม่ถูกส่งไปไหน (ห้ามออก broadcast)")
+        print("")
+
+        if not sample:
+            print("(ยังไม่มีข่าวในฐานข้อมูล)")
+            return
+        for n, row in enumerate(sample, 1):
+            notes = row.get("impact_notes") or []
+            acts = playbook.actions_for(notes)
+            print(f"{n}. {(row.get('title') or '').strip()}")
+            print(f"   {row.get('level', '-')} · คะแนน {row.get('score', 0)}"
+                  f" · {row.get('source_name') or row.get('source') or '-'}")
+            for note in notes:
+                print(f"   ⚠️ {note}")
+            if acts:
+                for k, act in enumerate(acts, 1):
+                    print(f"   🎯 {k}. {act}")
+            else:
+                print("   — (ไม่มีคู่มือ)")
+            print("")
     finally:
         con.close()
 
@@ -895,7 +956,8 @@ def main():
     parser.add_argument("--cluster-report", action="store_true",
                         help="read-only same-story duplicate audit (sends nothing)")
     parser.add_argument("--limit", type=int, metavar="N",
-                        help="cluster-report: only audit the first N eligible rows")
+                        help="cluster-report/preview-public/playbook: only use "
+                             "the first N rows")
     parser.add_argument("--backfill-story-keys", action="store_true",
                         help="fill story_key for rows stored before the column existed")
     parser.add_argument("--audience", action="store_true",
@@ -904,6 +966,9 @@ def main():
                         help="send one test message to the private destination")
     parser.add_argument("--preview-public", action="store_true",
                         help="print the team's version of the messages (sends nothing)")
+    parser.add_argument("--playbook", action="store_true",
+                        help="what to DO about the current top news "
+                             "(full version, sends nothing)")
     parser.add_argument("--build-archive", action="store_true",
                         help="build the public back-catalogue site (sends nothing)")
     parser.add_argument("--out", metavar="DIR",
@@ -929,6 +994,8 @@ def main():
         verify_recipient_cli(matcher_obj)
     elif args.preview_public:
         preview_public_cli(matcher_obj, args.limit)
+    elif args.playbook:
+        playbook_cli(matcher_obj, args.limit)
     elif args.build_archive:
         build_archive_cli(matcher_obj, args.out, args.require_guard,
                           args.min_rows)

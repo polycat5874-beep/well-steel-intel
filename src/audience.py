@@ -120,9 +120,19 @@ def _collect(bucket, text):
 def profile_secrets():
     """Full sentences out of the operator profile that must never be broadcast.
 
-    Sources: the note on every impact boost, and the title + note of every
-    watchlist entry, plus the AI persona. Cached in-process; call reset_cache()
-    after changing STEEL_INTEL_PROFILE_JSON.
+    Sources: the note AND the action on every impact boost, the title + note +
+    action of every watchlist entry, plus the AI persona. Cached in-process;
+    call reset_cache() after changing STEEL_INTEL_PROFILE_JSON.
+
+    An `action` (see src/playbook.py) is if anything MORE sensitive than the
+    note it belongs to: a note reads the news, an action says what this company
+    has to clear before it may run a furnace. The watchlist actions are watched
+    too, although nothing renders them yet - the watchman is deliberately wider
+    than the renderer, so the day somebody prints one it is already covered.
+
+    Reads `action` straight off the overlay rather than importing playbook: the
+    guard must not depend on the module it is guarding (and playbook imports
+    matcher, which would close an import cycle).
 
     Never raises: an unreadable profile yields [] (the first two layers are the
     real protection - this one is the seatbelt).
@@ -135,9 +145,11 @@ def profile_secrets():
         overlay, _source = load_profile_overlay()
         for group in ((overlay.get("company_profile") or {}).get("boosts") or []):
             _collect(found, group.get("note"))
+            _collect(found, group.get("action"))
         for item in (overlay.get("watchlist") or []):
             _collect(found, item.get("title"))
             _collect(found, item.get("note"))
+            _collect(found, item.get("action"))
         _collect(found, overlay.get("ai_persona"))
     except Exception as exc:  # noqa: BLE001 - a guard may never break a send
         log.warning("cannot load profile secrets for the public guard: %s", exc)
@@ -421,8 +433,14 @@ def mode_report(settings, con=None):
         "unset": "ยังไม่ได้ตั้ง LINE_USER_ID",
         "invalid": "⚠️ LINE_USER_ID ผิดรูปแบบ (ต้องเป็น U/C/R + เลขฐาน 16 อีก 32 ตัว)",
     }[state]
+    # Imported HERE, not at module scope: playbook imports matcher and this
+    # module is imported by summarizer, so a top-level import would close a
+    # cycle. The report is also the only thing in this file that needs it.
+    from . import playbook
+
     rounds = (settings or {}).get("team_digest_rounds") or []
     team_rt = bool((settings or {}).get("team_realtime_alerts"))
+    pb = playbook.stats()
     last_team = None
     if con is not None:
         try:
@@ -449,6 +467,8 @@ def mode_report(settings, con=None):
         "  ฉบับสาธารณะ (ทีม)  = พาดหัว + แหล่ง + เวลา + ลิงก์ + ระดับความสำคัญ"
         " + 'อีก N สำนักรายงานเรื่องเดียวกัน'",
         f"  ประโยคภายในที่ยามเฝ้าอยู่ : {len(profile_secrets())} ประโยค",
+        f"  คู่มือสิ่งที่ต้องทำ       : {pb['with_action']}/{pb['groups']} "
+        "กลุ่มความเสี่ยงมี action",
     ]
     if state == "unset":
         lines += [

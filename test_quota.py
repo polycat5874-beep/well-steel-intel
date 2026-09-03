@@ -20,6 +20,10 @@ WHAT IS BEING PROVEN
     G. audience        the team broadcast carries the news and NOTHING from the
                        operator profile, the private channel keeps the full
                        reading, and a malformed destination fails loudly.
+    I. playbook        an `action` (what to DO about a story) resolves to
+                       the right story, renders on the private version
+                       only, and cannot reach a broadcast, an archive page
+                       or the public config file by any route.
     H. archive         the public back-catalogue site carries the news and
                        nothing else: no secret field survives the projection, a
                        whole site built under the sentinel profile is clean, no
@@ -40,6 +44,7 @@ for _k in ("LINE_CHANNEL_ID", "LINE_CHANNEL_SECRET",
 for _k in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
     os.environ.pop(_k, None)
 
+import calendar                             # noqa: E402
 import contextlib                            # noqa: E402
 import io                                     # noqa: E402
 import json                                   # noqa: E402
@@ -52,7 +57,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
 import main                                   # noqa: E402  (never load_env()!)
-from src import audience, cluster, notifier, quota, storage, summarizer  # noqa: E402
+from src import (  # noqa: E402
+    audience, cluster, notifier, playbook, quota, storage, summarizer,
+)
 from src.matcher import Matcher               # noqa: E402
 from src.sources.base import BKK_TZ, now_bkk  # noqa: E402
 
@@ -371,10 +378,15 @@ def section_c():
     con = fresh_db()
     allowance = quota.month_allowance(SETTINGS)
     storage.set_meta(con, quota.realtime_month_key(), str(allowance))
+    # Days come from the CALENDAR, never a hard-coded 31: month_allowance()
+    # reserves the digests per real day, so this check used to fail every
+    # 30-day month (and every February) for no reason but the constant.
+    days = calendar.monthrange(now_bkk().year, now_bkk().month)[1]
     check("C7 เพดานเดือนบังคับได้ (แม้เป็นวันใหม่ที่งบรายวันเต็ม)",
-          allowance == 300 // 2 - 3 * 31
+          allowance == 300 // 2 - 3 * days
           and quota.realtime_budget_left(con, SETTINGS) == 0,
-          f"allowance={allowance} left={quota.realtime_budget_left(con, SETTINGS)}")
+          f"allowance={allowance} days={days} "
+          f"left={quota.realtime_budget_left(con, SETTINGS)}")
 
     con.close()
     con = fresh_db()
@@ -862,11 +874,17 @@ SENTINEL_NOTE = "ตราลับหนึ่ง ข้อมูลภาย�
 SENTINEL_WATCH = "ตราลับสอง เรื่องที่บริษัทเกาะติดเป็นความลับภายใน"
 SENTINEL_WNOTE = "ตราลับสาม บันทึกภายในห้ามส่งต่อบุคคลภายนอกเด็ดขาด"
 SENTINEL_PERSONA = "ตราลับสี่ บทบาทนักวิเคราะห์ที่บอกตัวตนบริษัทเจ้าของระบบ"
-SENTINELS = (SENTINEL_NOTE, SENTINEL_WATCH, SENTINEL_WNOTE, SENTINEL_PERSONA)
+# The playbook action (src/playbook.py). Added to SENTINELS on purpose: every
+# existing "nothing from the profile reached the public side" check (G4, H3, H5)
+# then covers actions automatically, instead of needing a parallel set of them.
+SENTINEL_ACTION = "ตราลับห้า สิ่งที่ต้องทำภายในที่ห้ามหลุดออกนอกบริษัท"
+SENTINELS = (SENTINEL_NOTE, SENTINEL_WATCH, SENTINEL_WNOTE, SENTINEL_PERSONA,
+             SENTINEL_ACTION)
 
 SENTINEL_PROFILE = {
     "company_profile": {"boosts": [
-        {"keywords": ["เตา IF", "มอก. 24"], "score": 5, "note": SENTINEL_NOTE},
+        {"keywords": ["เตา IF", "มอก. 24"], "score": 5, "note": SENTINEL_NOTE,
+         "action": SENTINEL_ACTION},
     ]},
     "watchlist": [
         {"id": "sentinel", "title": SENTINEL_WATCH, "deadline": None,
@@ -891,6 +909,7 @@ class using_profile:
         else:
             os.environ["STEEL_INTEL_PROFILE_JSON"] = json.dumps(self.profile)
         audience.reset_cache()
+        playbook.reset_cache()
         return self
 
     def __exit__(self, *exc):
@@ -899,6 +918,7 @@ class using_profile:
         else:
             os.environ["STEEL_INTEL_PROFILE_JSON"] = self._saved
         audience.reset_cache()
+        playbook.reset_cache()
         return False
 
 
@@ -1414,6 +1434,7 @@ class no_profile:
         matcher_mod.PROFILE_PATH = os.path.join(TMP_DIR, "no-such-profile.json")
         os.environ.pop("STEEL_INTEL_PROFILE_JSON", None)
         audience.reset_cache()
+        playbook.reset_cache()
         return self
 
     def __exit__(self, *exc):
@@ -1421,6 +1442,7 @@ class no_profile:
         if self._saved_env is not None:
             os.environ["STEEL_INTEL_PROFILE_JSON"] = self._saved_env
         audience.reset_cache()
+        playbook.reset_cache()
         return False
 
 
@@ -1961,6 +1983,298 @@ def section_h():
 
 
 # =========================================================================
+# I. playbook: what to DO about a story (and where an action may live)
+# =========================================================================
+
+# An `action` is not a nicer note - it is the instruction that names which
+# licences this plant runs under and what has to be cleared before a furnace is
+# started. So these checks answer two separate questions: does the playbook
+# resolve the RIGHT instruction for a story, and can an instruction reach a
+# public channel by ANY route (alert card, digest, archive page, CLI).
+
+PB_LOW = "โน้ตทดสอบคะแนนต่ำ สำหรับตรวจการเรียงลำดับคู่มือ"
+PB_HIGH = "โน้ตทดสอบคะแนนสูง สำหรับตรวจการเรียงลำดับคู่มือ"
+PB_TIE = "โน้ตทดสอบคะแนนเสมอ สำหรับตรวจการเรียงลำดับคู่มือ"
+PB_NOACT = "โน้ตทดสอบที่ตั้งใจไม่ผูกคู่มือเอาไว้เลย"
+PB_UNKNOWN = "โน้ตที่ไม่มีอยู่ในโปรไฟล์ปัจจุบันแม้แต่กลุ่มเดียว"
+
+PB_ACT_LOW = "คู่มือทดสอบหมายเลขหนึ่ง สิ่งที่ต้องทำเมื่อคะแนนต่ำ"
+PB_ACT_HIGH = "คู่มือทดสอบหมายเลขสอง สิ่งที่ต้องทำเมื่อคะแนนสูง"
+PB_ACT_TIE = "คู่มือทดสอบหมายเลขสาม สิ่งที่ต้องทำเมื่อคะแนนเสมอกัน"
+
+# score high -> low, ties in profile order: HIGH(5, #1) then TIE(5, #2) then
+# LOW(2, #0). The last group carries no action at all, on purpose.
+PB_PROFILE = {
+    "company_profile": {"boosts": [
+        {"keywords": ["คำทดสอบต่ำ"], "score": 2, "note": PB_LOW,
+         "action": PB_ACT_LOW},
+        {"keywords": ["คำทดสอบสูง"], "score": 5, "note": PB_HIGH,
+         "action": PB_ACT_HIGH},
+        {"keywords": ["คำทดสอบเสมอ"], "score": 5, "note": PB_TIE,
+         "action": PB_ACT_TIE},
+        {"keywords": ["คำทดสอบเปล่า"], "score": 4, "note": PB_NOACT},
+    ]},
+    "watchlist": [],
+}
+
+
+def pb_row(notes):
+    """A finished row/analysis pair (one dict, as a DB row really is)."""
+    return {
+        "id": 1, "title": "พาดหัวทดสอบคู่มือปฏิบัติ", "url": "https://x.test/pb",
+        "source_name": "ประชาชาติธุรกิจ", "level": "RED", "score": 21,
+        "topics": ["มาตรฐาน มอก."], "critical_hits": ["มอก."],
+        "published_datetime": "2026-08-27T10:00:00",
+        "summary": "เนื้อหาย่อสำหรับตรวจการ์ดคู่มือ.",
+        "impact_notes": list(notes), "watchlist_hits": [],
+    }
+
+
+def section_i():
+    print("\n--- I. คู่มือสิ่งที่ต้องทำ (playbook) ---")
+
+    # --- I1: the public config file may never carry an action -------------
+    with open(os.path.join(BASE_DIR, "config", "keywords.json"),
+              encoding="utf-8") as fh:
+        kw_data = json.load(fh)
+    action_keys = []
+
+    def walk_actions(node, path="$"):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if k == "action":
+                    action_keys.append(f"{path}.{k}")
+                walk_actions(v, f"{path}.{k}")
+        elif isinstance(node, list):
+            for n, v in enumerate(node):
+                walk_actions(v, f"{path}[{n}]")
+
+    walk_actions(kw_data)
+    check("I1 config/keywords.json (ไฟล์สาธารณะ) ไม่มีคีย์ action ที่ใดเลย "
+          "และมีหมายเหตุกำกับไว้",
+          not action_keys and "_action_note" in kw_data.get("settings", {})
+          and "src/playbook.py" in kw_data["settings"]["_action_note"],
+          f"action_keys={action_keys}")
+
+    # --- I2: resolution, ordering, cap, unknown notes, empty profile -------
+    with using_profile(PB_PROFILE):
+        st = playbook.stats()
+        ordered = playbook.actions_for([PB_LOW, PB_TIE, PB_HIGH])
+        capped = playbook.actions_for([PB_LOW, PB_TIE, PB_HIGH], 2)
+        deduped = playbook.actions_for([PB_HIGH, PB_HIGH, PB_HIGH])
+        unknown = playbook.actions_for([PB_UNKNOWN])
+        no_action_grp = playbook.actions_for([PB_NOACT])
+        mixed = playbook.actions_for([PB_UNKNOWN, PB_HIGH])
+        empty_in = playbook.actions_for([])
+        none_in = playbook.actions_for(None)
+        has_hi = playbook.has_action([PB_HIGH])
+        has_unknown = playbook.has_action([PB_UNKNOWN])
+    raised_i2 = None
+    with no_profile():
+        try:
+            blank = playbook.actions_for([PB_HIGH, PB_LOW])
+            blank_stats = playbook.stats()
+        except Exception as exc:  # noqa: BLE001 - that is what must not happen
+            raised_i2, blank, blank_stats = exc, None, None
+    check("I2 actions_for: เรียงตามคะแนน · เสมอเรียงตามโปรไฟล์ · ตัดตาม limit "
+          "· ตัดซ้ำ · โน้ตแปลกหน้าไม่ได้คู่มือ · ไม่มีโปรไฟล์ -> [] ไม่ throw",
+          ordered == [PB_ACT_HIGH, PB_ACT_TIE, PB_ACT_LOW]
+          and capped == [PB_ACT_HIGH, PB_ACT_TIE]
+          and deduped == [PB_ACT_HIGH]
+          and unknown == [] and no_action_grp == []
+          and mixed == [PB_ACT_HIGH]
+          and empty_in == [] and none_in == []
+          and has_hi and not has_unknown
+          and st == {"groups": 4, "with_action": 3, "source": "env"}
+          and raised_i2 is None and blank == []
+          and blank_stats["with_action"] == 0,
+          f"ordered={len(ordered)} capped={len(capped)} unknown={unknown} "
+          f"stats={st} raised={raised_i2!r} blank={blank}")
+
+    # --- I3: the alert card ------------------------------------------------
+    with using_profile(PB_PROFILE):
+        row_act = pb_row([PB_HIGH, PB_LOW])
+        full_card = summarizer.build_critical_alert(row_act, row_act,
+                                                    index=1, total=1)
+        pub_card = summarizer.build_critical_alert(
+            audience.public_row(row_act), audience.public_row(row_act),
+            index=1, total=1, audience="public")
+        # A row whose note carries NO action must render the pre-playbook bytes.
+        row_plain = pb_row([PB_NOACT])
+        card_plain = summarizer.build_critical_alert(row_plain, row_plain,
+                                                     index=1, total=1)
+    with no_profile():
+        # Same row, built while the playbook cannot resolve anything at all:
+        # this is the byte-for-byte reference of "how the card looked before".
+        card_reference = summarizer.build_critical_alert(
+            pb_row([PB_NOACT]), pb_row([PB_NOACT]), index=1, total=1)
+    check("I3 การ์ด: ฉบับเต็มมีบล็อกคู่มือ (เรียงถูก) · ฉบับสาธารณะไม่มีเลย · "
+          "แถวที่ไม่มีคู่มือ -> การ์ดเท่าเดิมทุกไบต์",
+          summarizer.ACTION_HEAD in full_card
+          and PB_ACT_HIGH in full_card and PB_ACT_LOW in full_card
+          and full_card.index(PB_ACT_HIGH) < full_card.index(PB_ACT_LOW)
+          and "🔗 ลิงก์ข่าว" in full_card
+          and full_card.index(summarizer.ACTION_HEAD)
+          < full_card.index("🔗 ลิงก์ข่าว")
+          and summarizer.ACTION_HEAD not in pub_card
+          and PB_ACT_HIGH not in pub_card and PB_ACT_LOW not in pub_card
+          and summarizer.ACTION_HEAD not in card_plain
+          and card_plain == card_reference,
+          f"head_in_full={summarizer.ACTION_HEAD in full_card} "
+          f"head_in_pub={summarizer.ACTION_HEAD in pub_card} "
+          f"plain_identical={card_plain == card_reference}")
+
+    # --- I4: the digest ----------------------------------------------------
+    wl4 = [{"id": "w", "title": "เรื่องที่เกาะติดสำหรับทดสอบคู่มือ",
+            "deadline": None, "keywords": [], "note": "โน้ต watchlist ทดสอบ"}]
+    with using_profile(PB_PROFILE):
+        items4 = [pb_row([PB_HIGH, PB_LOW])]
+        full_digest = summarizer.build_daily_summary(items4, wl4, "ทดสอบ")
+        pub_digest = summarizer.build_daily_summary(
+            audience.public_rows(items4), wl4, "ทดสอบ", audience="public")
+    check("I4 สรุปรายวัน: ฉบับเต็มมี '🎯 ทำต่อ:' (คู่มือเดียวที่สำคัญที่สุด) · "
+          "ฉบับสาธารณะไม่มี",
+          "🎯 ทำต่อ:" in full_digest and PB_ACT_HIGH in full_digest
+          and PB_ACT_LOW not in full_digest        # ACTION_MAX_DIGEST = 1
+          and "🎯 ทำต่อ:" not in pub_digest
+          and PB_ACT_HIGH not in pub_digest
+          and "พาดหัวทดสอบคู่มือปฏิบัติ" in pub_digest,   # ข่าวยังออก
+          f"full_has={'🎯 ทำต่อ:' in full_digest} "
+          f"pub_has={'🎯 ทำต่อ:' in pub_digest}")
+
+    # --- I5: the watchman must count actions as secrets --------------------
+    with using_profile(PB_PROFILE):
+        secrets = audience.profile_secrets()
+        leak_hit = audience.find_leaks(f"ข้อความปกติ {PB_ACT_HIGH} ต่อท้าย")
+        guarded, leaks5 = audience.guard_public_blocks(
+            [f"บล็อกที่มี {PB_ACT_TIE} ปนมา"])
+    with using_profile(SENTINEL_PROFILE):
+        sent_secrets = audience.profile_secrets()
+    # watchlist actions are guarded too, although nothing renders them yet
+    wl_profile = {
+        "company_profile": {"boosts": []},
+        "watchlist": [{"id": "w", "title": "หัวข้อเกาะติดทดสอบยามเฝ้า",
+                       "deadline": None, "keywords": [],
+                       "action": PB_ACT_TIE}],
+    }
+    with using_profile(wl_profile):
+        wl_watched = PB_ACT_TIE in audience.profile_secrets()
+    check("I5 ยามนับ action เป็นประโยคลับ (ทั้ง boost และ watchlist) "
+          "· find_leaks เจอ · guard แทนที่บล็อก",
+          # 4 notes + 3 actions: the group with no action still contributes its
+          # note, and every action adds a sentence the watchman did not have
+          # before this feature (that growth is the point of the check).
+          PB_ACT_HIGH in secrets and PB_ACT_LOW in secrets
+          and PB_ACT_TIE in secrets and len(secrets) == 7
+          and leak_hit == [PB_ACT_HIGH]
+          and guarded == [audience.REDACTED_BLOCK] and len(leaks5) == 1
+          and SENTINEL_ACTION in sent_secrets and len(sent_secrets) == 5
+          and wl_watched,
+          f"secrets={len(secrets)} leak={leak_hit} sent={len(sent_secrets)} "
+          f"wl={wl_watched}")
+
+    # --- I6: realtime end to end, under the sentinel profile ---------------
+    with using_profile(SENTINEL_PROFILE):
+        m_s = sentinel_matcher()
+        con = fresh_db()
+        storage.set_meta(con, "baseline_seeded", "1")
+        seed_secret_news(con, 3)
+        con.close()
+        team_rt = run_realtime_as(m_s)             # no private id -> broadcast
+
+        con = fresh_db()
+        storage.set_meta(con, "baseline_seeded", "1")
+        seed_secret_news(con, 3)
+        con.close()
+        priv_rt = run_realtime_as(m_s, user_id=GOOD_ID)
+
+        team_text = broadcast(team_rt)
+        priv_text = pushed(priv_rt)
+    check("I6 แจ้งเตือนด่วนจริง: broadcast ไม่มี action และยามชั้นสามไม่ต้องทำงาน "
+          "· push ส่วนตัวมี action ครบ",
+          SENTINEL_ACTION not in team_text
+          and summarizer.ACTION_HEAD not in team_text
+          and audience.REDACTED_BLOCK not in team_text   # ชั้น 1-2 พอเอง
+          and "ข่าวลับ 0" in team_text                    # ข่าวยังออกทีม
+          and SENTINEL_ACTION in priv_text
+          and summarizer.ACTION_HEAD in priv_text
+          and broadcast(priv_rt) == "",
+          f"team_leak={SENTINEL_ACTION in team_text} "
+          f"guard_fired={audience.REDACTED_BLOCK in team_text} "
+          f"priv_has={SENTINEL_ACTION in priv_text}")
+
+    # --- I7: the 18:00 digest goes to BOTH - only one may carry the action --
+    with using_profile(SENTINEL_PROFILE):
+        m_s7 = sentinel_matcher()
+        con = fresh_db()
+        storage.set_meta(con, "last_summary_at", "2000-01-01T00:00:00")
+        seed_secret_news(con, 3)
+        con.close()
+        dg = run_digest_as(m_s7, user_id=GOOD_ID, round_hour=18)
+        dg_priv, dg_team = pushed(dg), broadcast(dg)
+    check("I7 สรุปรอบ 18:00 (ส่งทั้งสองปลายทาง): ส่วนตัวมี '🎯 ทำต่อ:' · "
+          "ทีม broadcast ไม่มี action และยามไม่ต้องทำงาน",
+          len(dg.calls) == 2
+          and "🎯 ทำต่อ:" in dg_priv and SENTINEL_ACTION in dg_priv
+          and "🎯 ทำต่อ:" not in dg_team
+          and SENTINEL_ACTION not in dg_team
+          and audience.REDACTED_BLOCK not in dg_team
+          and "สรุปข่าวเหล็ก" in dg_team,
+          f"calls={len(dg.calls)} priv={'🎯 ทำต่อ:' in dg_priv} "
+          f"team_leak={SENTINEL_ACTION in dg_team}")
+
+    # --- I8: the public archive ------------------------------------------
+    from src import archive
+    outdir8 = out_dir()
+    with using_profile(SENTINEL_PROFILE):
+        con = fresh_db()
+        seed_secret_news(con, 3)
+        seed_archive(con, [{"title": "สมอ. ทบทวนมาตรฐานเหล็กเส้นรอบใหม่ (คลัง)",
+                            "when": "2026-08-27T10:05:00"}])
+        stats8 = archive.build_site(con, SETTINGS_ARCHIVE, outdir8,
+                                    require_guard=True, min_rows=1)
+        con.close()
+        pages8 = html_pages(read_site(outdir8))
+        hits8 = [p for p, t in pages8.items()
+                 if SENTINEL_ACTION in t or summarizer.ACTION_HEAD in t
+                 or "🎯 ทำต่อ:" in t]
+    check("I8 คลังข่าวสาธารณะที่สร้างใต้โปรไฟล์ตราลับ: ไม่มีหน้าใดมี action",
+          bool(pages8) and not hits8 and stats8["leaks"] == 0,
+          f"pages={len(pages8)} hits={hits8}")
+
+    # --- I9: --playbook is READ-ONLY --------------------------------------
+    con = fresh_db()
+    storage.set_meta(con, "baseline_seeded", "1")
+    seed_news(con, 4)
+    con.close()
+    con = storage.connect()
+    meta_before = con.execute("SELECT key, value FROM meta ORDER BY key").fetchall()
+    alerted_before = n_alerted(con)
+    con.close()
+    buf9 = io.StringIO()
+    with using_profile(PB_PROFILE):
+        m9 = make_matcher()
+        with line_channel() as stub9:
+            with contextlib.redirect_stdout(buf9):
+                main.playbook_cli(m9, limit=4)
+    con = storage.connect()
+    meta_after = con.execute("SELECT key, value FROM meta ORDER BY key").fetchall()
+    alerted_after = n_alerted(con)
+    con.close()
+    out9 = buf9.getvalue()
+    check("I9 --playbook: ไม่ส่ง LINE · ไม่ mark alerted · ไม่แตะ meta "
+          "· เตือนว่าเป็นฉบับเต็ม + ยังไม่ได้ตั้ง LINE_USER_ID",
+          len(stub9.calls) == 0 and alerted_before == alerted_after == 0
+          and meta_before == meta_after
+          and "อย่าแคปหน้าจอนี้ส่งต่อ" in out9
+          and "3/4 กลุ่มความเสี่ยงมี action" in out9
+          and "ยังไม่ได้ตั้ง LINE_USER_ID" in out9
+          and "(ไม่มีคู่มือ)" in out9,      # seed_news notes ไม่ตรงโปรไฟล์นี้
+          f"calls={len(stub9.calls)} alerted={alerted_before}->{alerted_after} "
+          f"meta_same={meta_before == meta_after}")
+
+
+# =========================================================================
 
 def main_test():
     if hasattr(sys.stdout, "reconfigure"):
@@ -1977,6 +2291,7 @@ def main_test():
         section_f()
         section_g()
         section_h()
+        section_i()
     finally:
         storage.connect = _real_connect
         shutil.rmtree(TMP_DIR, ignore_errors=True)

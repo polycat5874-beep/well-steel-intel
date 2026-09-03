@@ -28,6 +28,7 @@ from datetime import date, datetime
 from src.audience import classify_error, mask_error
 from src.cluster import normalize_title
 from src.matcher import load_profile_overlay
+from src.playbook import actions_for
 from src.sources.base import split_sentences
 
 log = logging.getLogger("steel_intel.summarizer")
@@ -43,6 +44,14 @@ LEVEL_SHOW_CAP = {"RED": 99, "ORANGE": 8, "YELLOW": 5}
 
 HEAVY_RULE = "━━━━━━━━━━━━━━━━━━"
 LIGHT_RULE = "-------------------"
+
+# The playbook block (src/playbook.py): what to DO about a story, printed only
+# on the private/full version because an action names this operator's licences.
+# It is APPENDED, never substituted - a story with no action renders exactly the
+# bytes it rendered before this feature existed.
+ACTION_HEAD = "🎯 สิ่งที่ต้องทำต่อ"
+ACTION_MAX_CARD = 3        # an alert card can carry a short numbered list
+ACTION_MAX_DIGEST = 1      # the digest has one line per story, so one action
 
 
 def thai_date(d=None):
@@ -180,6 +189,10 @@ def build_critical_alert(item, analysis, index=None, total=None, audience="full"
             lines.append(f"   • {note}")
         for w in analysis.get("watchlist_hits", []):
             lines.append(f"   ⏳ เกาะติด: {w}")
+        acts = actions_for(analysis.get("impact_notes"), ACTION_MAX_CARD)
+        if acts:
+            lines += ["", ACTION_HEAD]
+            lines += [f"   {n}. {a}" for n, a in enumerate(acts, 1)]
 
     if item.get("url"):
         lines += ["", "🔗 ลิงก์ข่าว", f"   {item['url']}"]
@@ -302,6 +315,8 @@ def _render_level_block(level, rows, audience="full"):
             if audience != "public":
                 for note in it.get("impact_notes", [])[:1]:
                     parts.append(f"   ⚠️ {note}")
+                for a in actions_for(it.get("impact_notes"), ACTION_MAX_DIGEST):
+                    parts.append(f"   🎯 ทำต่อ: {a}")
             if it.get("url"):
                 parts.append(f"   🔗 {it['url']}")
             idx += 1

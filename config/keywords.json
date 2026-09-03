@@ -282,6 +282,7 @@
     }
   ],
   "settings": {
+    "_action_note": "Playbook actions are defined ONLY in the operator profile overlay (STEEL_INTEL_PROFILE_JSON / config/profile.json). This public file must never contain an `action` key: an action names the company's licences and is private by construction. See src/playbook.py.",
     "alert_max_per_cycle": 8,
     "alert_push_budget_per_day": 2,
     "alert_override_levels": [
