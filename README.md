@@ -2,7 +2,7 @@
 
 เฝ้าข่าว 9 หัวข้อจากหลายแหล่ง → แจ้งเตือนด่วนผ่าน **LINE** เมื่อเจอข่าวสำคัญ (ทุก 15 นาที) + สรุปประจำวัน 3 รอบ (07:00 / 12:00 / 18:00) พร้อม **Impact Scoring เทียบโปรไฟล์บริษัท** และ **Watchlist นับถอยหลัง** (AD เหล็กลวด พ.ค. 2026 / แก้ มอก. ตัดเหล็ก IF / circumvention HRC)
 
-> ช่องทางแจ้งเตือนหลัก = **LINE Messaging API (LINE Official Account)** | Telegram = fallback ออปชัน | notifier เป็น module แยก เพิ่ม Slack/อีเมลได้
+> ช่องทางแจ้งเตือนช่องทางเดียว = **LINE Messaging API (LINE Official Account)** | notifier เป็น module แยก เพิ่ม Slack/อีเมลได้
 
 ## ติดตั้งครั้งแรก
 ```
@@ -22,7 +22,7 @@ copy .env.example .env
 > 💡 LINE OA ฟรี ส่ง push ~500 ข้อความ/เดือน — ระบบรวบหลายข่าวใน 1 push เพื่อประหยัดโควต้า เกินค่อยอัปเกรดแพ็กเกจ
 
 ### ออปชัน
-- **Telegram fallback:** ถ้าไม่กรอก LINE แต่กรอก `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` ระบบจะใช้ Telegram แทนอัตโนมัติ
+- **ไม่มีช่องทางสำรองแล้ว:** Telegram fallback ถูกถอดออก (2026-09-05) เพราะไม่เคยถูกตั้งค่าจริงเลย — ถ้าไม่กรอก LINE ระบบจะอยู่โหมด dry-run (พิมพ์ข้อความออกหน้าจอ ไม่ส่งออก)
 - **`ANTHROPIC_API_KEY`:** เปิดบทวิเคราะห์ AI ท้ายสรุปประจำวัน — ไม่มีก็ทำงานครบ (Impact Scoring เป็น rule-based อยู่แล้ว)
 - ไม่กรอกช่องทางใดเลย = **DRY-RUN** (พิมพ์ข้อความลง console ใช้ทดสอบ)
 

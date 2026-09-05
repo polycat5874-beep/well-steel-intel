@@ -1,5 +1,30 @@
 # -*- coding: utf-8 -*-
 """Best-effort scraper for government news pages (DFT / TISI / Customs / DIW).
+
+!!! NOT CALLED BY ANYTHING - RETIRED 2026-09-05 (Phase 7a) !!!
+--------------------------------------------------------------
+main.collect_cycle no longer calls fetch_all() and config/sources.json now has
+`"gov_pages": []`. The file is kept ON PURPOSE (link extraction, the Thai
+headline heuristic and the never-crash contract are all still correct) so that
+the day one of these sites exposes a JSON feed, only the fetch half has to be
+written.
+
+WHY IT WAS RETIRED - measured, not assumed:
+  * TISI and DIW returned `0 candidate links` on EVERY cycle (~96/day).
+  * DFT stopped responding entirely: its TLS chain fails with
+    `SSL UNEXPECTED_EOF` even with the GeoTrust intermediate in certs/.
+  * Customs returned its full 30-link cap, but every one of them was a SITE
+    MENU entry, not news, and 5 of those menu links scored as RELEVANT and were
+    being written into news.db as if they were articles.
+All four render their news client-side with JavaScript, so no static scrape can
+ever see it. The group cost ~5.5s of every cycle for that.
+
+BEFORE SWITCHING IT BACK ON: find a JSON/API endpoint. Re-pointing this at
+another HTML listing page will fail the same way. Coverage in the meantime comes
+from google_news.site_queries (site:dft.go.th / tisi.go.th / customs.go.th /
+diw.go.th / industry.go.th), which reads the same announcements off an index
+Google has already rendered.
+
 Extracts <a> links whose text looks like a Thai news headline. Layout changes
 or downtime never crash the cycle - Google News site: queries are the backstop."""
 import logging

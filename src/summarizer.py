@@ -383,7 +383,7 @@ def build_system_alert(round_label, error, audience="full"):
 
 
 def build_daily_summary(items, watchlist, round_label, health=None, n_rows=None,
-                        audience="full"):
+                        audience="full", due_block=None):
     """Daily summary message (Thai), grouped RED/ORANGE/YELLOW -> topic + watchlist.
 
     `n_rows` is how many DATABASE ROWS the `items` stand for once same-story rows
@@ -396,7 +396,15 @@ def build_daily_summary(items, watchlist, round_label, health=None, n_rows=None,
     company is afraid of, and dated - it would be the single most revealing
     thing in the message) and the AI analysis paragraph, which is written from
     the company's point of view. The header, the news itself and the "🩺" proof
-    of life stay, so a broadcast still proves the watcher ran."""
+    of life stay, so a broadcast still proves the watcher ran.
+
+    `due_block` is the watchlist deadline nudge (src/reminder.py), already
+    rendered by the caller because it needs a database connection for its
+    once-a-day bookkeeping. It is appended right after the watchlist countdown
+    it refers to, and ONLY on the full version - it names watchlist titles, the
+    same reason the countdown itself is private. An empty/None value appends
+    NOTHING, so a digest with no due deadline is byte-for-byte the digest that
+    shipped before this feature existed."""
     count = f"ข่าวใหม่ {len(items)} ชิ้น"
     if n_rows is not None and n_rows != len(items):
         count = f"ข่าวใหม่ {len(items)} เรื่อง (จาก {n_rows} ชิ้น)"
@@ -409,11 +417,16 @@ def build_daily_summary(items, watchlist, round_label, health=None, n_rows=None,
     # also proves the watcher ran, at no extra push cost.
     footer = [f"🩺 {health}"] if health else []
     is_public = audience == "public"
+    # Layer 2 of the audience split (src/audience.py): the renderer simply does
+    # not emit the block for a public reader, whatever the caller passed.
+    due = "" if is_public else (due_block or "").strip()
     if not items:
         body = ["", "ไม่มีข่าวใหม่ที่เกี่ยวข้องในรอบนี้", "", LIGHT_RULE, ""]
         # The quiet-day digest hides the watchlist too: "no news" is exactly the
         # message where the watchlist would be the only content worth reading.
         tail = [] if is_public else [build_watchlist_block(watchlist)]
+        if due:
+            tail = tail + ["", LIGHT_RULE, due]
         return "\n".join(header + body + tail + footer + [HEAVY_RULE])
 
     groups = {"RED": [], "ORANGE": [], "YELLOW": []}
@@ -434,6 +447,11 @@ def build_daily_summary(items, watchlist, round_label, health=None, n_rows=None,
 
     if not is_public:
         parts += ["", LIGHT_RULE, build_watchlist_block(watchlist)]
+        # Directly after the countdown it belongs to, and before the optional AI
+        # paragraph: an overdue deadline is the actionable half of the watchlist
+        # and must not end up underneath an essay.
+        if due:
+            parts += ["", LIGHT_RULE, due]
         ai_text = ai_deep_summary(groups["RED"] + groups["ORANGE"])
         if ai_text:
             parts += ["", LIGHT_RULE, "🤖 บทวิเคราะห์ AI:", ai_text]

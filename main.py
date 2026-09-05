@@ -2,7 +2,7 @@
 """steel-intel - steel industry news monitor + executive alerts.
 
 Schedules (per approved spec):
-  * realtime check every 15 minutes -> instant Telegram alert on critical news
+  * realtime check every 15 minutes -> instant LINE alert on critical news
   * daily summary at 07:00 / 12:00 / 18:00 (morning / noon / evening rounds)
 
 Two audiences (src/audience.py): the private destination gets the full message,
@@ -39,10 +39,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
 from src import (  # noqa: E402
-    archive, audience, storage, notifier, summarizer, quota, cluster,
+    archive, audience, storage, notifier, reminder, summarizer, quota, cluster,
 )
 from src.matcher import Matcher  # noqa: E402
-from src.sources import google_news, rss_feeds, gov_sites  # noqa: E402
+from src.sources import google_news, rss_feeds  # noqa: E402
 from src.sources.base import (  # noqa: E402
     enrich_article, summarise_text, is_junk_title, is_fresh, now_bkk,
 )
@@ -106,16 +106,22 @@ def load_sources_cfg():
 
 
 def collect_cycle(matcher_obj):
-    """Fetch all 7 source groups, analyze, store new relevant items.
-    Returns (n_fetched, n_new)."""
+    """Fetch every configured source, analyze, store new relevant items.
+    Returns (n_fetched, n_new).
+
+    Direct government-site scraping (src/sources/gov_sites.py) was retired on
+    2026-09-05: DFT/TISI/Customs/DIW all render their news with JavaScript, so
+    the scrape returned either nothing or the site's own navigation menu - which
+    then scored as relevant and was stored as news. Those domains are covered by
+    google_news.site_queries instead (see config/sources.json _gov_pages_note).
+    """
     cfg = load_sources_cfg()
     trusted = cfg.get("trusted_sources", {})
     items = []
-    # Trust gate (anti-fake-news) applies to Google News; gov_pages + direct RSS
-    # feeds are trusted by origin.
+    # Trust gate (anti-fake-news) applies to Google News; direct RSS feeds are
+    # trusted by origin.
     items += google_news.fetch_all(cfg.get("google_news", {}), trusted)
     items += rss_feeds.fetch_all(cfg.get("rss_feeds", []))
-    items += gov_sites.fetch_all(cfg.get("gov_pages", []))
 
     # Freshness window (anti-stale): an article older than this is ignored even
     # if it's brand-new to the DB. Timezone-aware in Asia/Bangkok (see is_fresh).
@@ -348,11 +354,17 @@ def realtime_job(matcher_obj):
         con.close()
 
 
-def _digest_private(matcher_obj, targets, items, n_rows, round_label, health):
+def _digest_private(matcher_obj, targets, items, n_rows, round_label, health,
+                    due_block=None):
     """Send the FULL digest to the private destination(s).
 
     Returns (used_requests, ok, state) where state is what the public copy uses
     to decide whether to add its "could not reach the operator" footnote.
+
+    `due_block` (src/reminder.py) is computed ONCE by the caller and passed in,
+    not built here: it writes a once-a-day meta key, and building it per target
+    would spend that key on the first destination and leave the second without
+    the block. It never reaches _digest_public - a watchlist title is private.
     """
     used_total, any_ok = 0, False
     state = audience.private_user_id()[1]      # "ok" | "unset" | "invalid"
@@ -360,7 +372,7 @@ def _digest_private(matcher_obj, targets, items, n_rows, round_label, health):
         try:
             msg = summarizer.build_daily_summary(
                 items, matcher_obj.cfg["watchlist"], round_label,
-                health=health, n_rows=n_rows,
+                health=health, n_rows=n_rows, due_block=due_block,
             )
             ok, used = notifier.send_counted(msg, to=target["to"])
             used_total += used
@@ -517,9 +529,23 @@ def daily_summary_job(matcher_obj, round_label, round_hour=None):
         targets = audience.digest_targets(matcher_obj.settings, con, round_hour)
         private = [t for t in targets if t["audience"] == "full"]
         public = [t for t in targets if t["audience"] == "public"]
+        # Watchlist deadline nudge. Computed only when there IS a private
+        # destination: it burns a once-a-day meta key, and spending that key on
+        # a message nobody receives would silently eat the day's reminder.
+        # Rides inside the digest that is already going out - zero extra LINE
+        # requests - and reminder.nudge_block never raises, so it cannot make a
+        # healthy round trip the dead-man's switch.
+        due_block = ""
+        if private:
+            due_block = reminder.nudge_block(
+                matcher_obj.cfg["watchlist"], matcher_obj.settings, con)
+            if due_block:
+                log.info("watchlist nudge: %d entry(ies) due today",
+                         due_block.count("•"))
         # Private first: whether it got through decides what the public copy says.
         used_private, ok_private, private_state = _digest_private(
-            matcher_obj, private, items, n_rows, round_label, health)
+            matcher_obj, private, items, n_rows, round_label, health,
+            due_block=due_block)
         used_team, ok_team = _digest_public(
             matcher_obj, public, items, n_rows, round_label, health_public,
             private_state)
@@ -653,6 +679,9 @@ PUBLIC_FORBIDDEN_MARKERS = (
     # licences and obligations, so seeing either of these in a public message
     # means the audience split failed upstream.
     summarizer.ACTION_HEAD, "🎯 ทำต่อ:",
+    # The watchlist deadline nudge (src/reminder.py). Same reason as the
+    # watchlist block above it: the line names a watchlist title and a date.
+    reminder.NUDGE_HEAD,
 )
 
 

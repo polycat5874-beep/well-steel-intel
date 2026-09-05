@@ -6,8 +6,9 @@
   python test_alert.py --critical critical alert only
   python test_alert.py --daily    daily summary only
 
-If TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID are set in .env the messages are
-actually delivered to Telegram - use this to verify the bot end-to-end.
+With LINE credentials in .env the messages are actually delivered to the
+Official Account - use this to verify the channel end-to-end. Without them
+everything runs in dry-run and is printed to the console instead.
 """
 import argparse
 import logging
@@ -94,7 +95,7 @@ def main():
         notifier.send(msg)
 
     print(f"\nDone. Active channel = {notifier.active_channel()} "
-          f"(dry-run prints to console; line/telegram delivers for real).")
+          f"(dry-run prints to console; line delivers for real).")
 
 
 if __name__ == "__main__":

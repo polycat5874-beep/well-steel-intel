@@ -24,6 +24,10 @@ WHAT IS BEING PROVEN
                        the right story, renders on the private version
                        only, and cannot reach a broadcast, an archive page
                        or the public config file by any route.
+    J. cleanup+        gov_pages and the Telegram fallback are really gone
+       reminders       without disturbing any send path, and a watchlist
+                       deadline nudges the operator - on the private version
+                       only, at zero extra push cost, once a day at most.
     H. archive         the public back-catalogue site carries the news and
                        nothing else: no secret field survives the projection, a
                        whole site built under the sentinel profile is clean, no
@@ -41,8 +45,6 @@ os.environ.pop("DATABASE_URL", None)          # never write to Supabase
 for _k in ("LINE_CHANNEL_ID", "LINE_CHANNEL_SECRET",
            "LINE_CHANNEL_ACCESS_TOKEN", "LINE_USER_ID"):
     os.environ.pop(_k, None)                  # never push to the real LINE OA
-for _k in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
-    os.environ.pop(_k, None)
 
 import calendar                             # noqa: E402
 import contextlib                            # noqa: E402
@@ -58,7 +60,7 @@ sys.path.insert(0, BASE_DIR)
 
 import main                                   # noqa: E402  (never load_env()!)
 from src import (  # noqa: E402
-    audience, cluster, notifier, playbook, quota, storage, summarizer,
+    audience, cluster, notifier, playbook, quota, reminder, storage, summarizer,
 )
 from src.matcher import Matcher               # noqa: E402
 from src.sources.base import BKK_TZ, now_bkk  # noqa: E402
@@ -68,6 +70,9 @@ if not VERBOSE:
     logging.disable(logging.CRITICAL)
 
 # The collector must NEVER run here: it would fetch ~2,700 live articles.
+# Section J calls the real one with every fetcher stubbed, to prove which
+# source groups it still reaches for.
+_real_collect_cycle = main.collect_cycle
 main.collect_cycle = lambda matcher_obj: (0, 0)
 
 TMP_DIR = tempfile.mkdtemp(prefix="steel-intel-quota-test-")
@@ -2275,6 +2280,383 @@ def section_i():
 
 
 # =========================================================================
+# J. Phase 7a cleanup (gov_pages / Telegram) + Phase 6b watchlist nudges
+# =========================================================================
+
+# Watchlist titles used by the reminder checks. Sentinel-flavoured on purpose,
+# so the public-side checks double as leak checks: a title that reaches the
+# broadcast is unmistakable.
+WL_DUE_TITLE = "ตราลับหก เรื่องภายในที่ใกล้ครบกำหนดห้ามเผยแพร่"
+WL_OVERDUE_TITLE = "ตราลับเจ็ด เรื่องภายในที่เลยกำหนดแล้วห้ามเผยแพร่"
+
+REM_SETTINGS = {"watchlist_warn_days": [30, 14, 7, 3, 1],
+                "watchlist_overdue_repeat_days": 7}
+
+
+def wl_entry(eid, title, days, note=None):
+    """One watchlist entry whose deadline is `days` from today (None = no clock)."""
+    deadline = None
+    if days is not None:
+        deadline = (now_bkk().date() + timedelta(days=days)).isoformat()
+    out = {"id": eid, "title": title, "deadline": deadline,
+           "keywords": ["มอก.", "เตา IF"]}
+    if note:
+        out["note"] = note
+    return out
+
+
+def rem_profile(watchlist):
+    """SENTINEL_PROFILE with a different watchlist bolted on."""
+    prof = json.loads(json.dumps(SENTINEL_PROFILE))
+    prof["watchlist"] = watchlist
+    return prof
+
+
+class DeadCon:
+    """A connection whose every query fails (a paused / unreachable database)."""
+
+    def execute(self, *a, **k):
+        raise RuntimeError("tenant or user not found")
+
+    def commit(self):
+        raise RuntimeError("tenant or user not found")
+
+    def close(self):
+        pass
+
+
+NUDGE_HEAD = "⏰ ใกล้ครบกำหนด"
+
+
+def section_j():
+    print("\n--- J. เก็บกวาด (gov_pages/Telegram) + เตือน watchlist ใกล้ครบกำหนด ---")
+
+    # --- J1: the gov scraper is off the collect path entirely --------------
+    from src.sources import gov_sites as gov_mod
+    stamp = now_bkk().strftime("%Y-%m-%dT%H:%M:%S")
+
+    def wire_item(i, outlet):
+        return {
+            "title": f"ข่าวสาย {outlet} {i} สมอ. เตรียมแก้ มอก. 24-2559 ตัดเหล็กเส้นเตา IF",
+            "url": f"https://example.test/{outlet}/{i}",
+            "source": outlet, "source_name": "ประชาชาติธุรกิจ",
+            "published": stamp, "published_datetime": stamp,
+            "summary": "เนื้อหาทดสอบสำหรับตรวจว่าเส้นทางเก็บข่าวยังทำงานปกติ.",
+        }
+
+    def boom(*a, **k):
+        raise AssertionError("gov_sites.fetch_all was called by collect_cycle")
+
+    # A config that still HAS gov_pages, so this proves collect_cycle IGNORES
+    # the key - not merely that the shipped file happens to be empty.
+    loaded_cfg = {}
+
+    def fake_cfg():
+        with io.open(os.path.join(BASE_DIR, "config", "sources.json"),
+                     encoding="utf-8") as f:
+            loaded_cfg.update(json.load(f))
+        cfg = dict(loaded_cfg)
+        cfg["gov_pages"] = [{"name": "ยังค้างอยู่ในไฟล์", "url": "https://x.test/",
+                             "base": "https://x.test"}]
+        return cfg
+
+    saved = (main.google_news.fetch_all, main.rss_feeds.fetch_all,
+             main.load_sources_cfg, gov_mod.fetch_all)
+    con = fresh_db()
+    con.close()
+    raised, fetched, n_new = None, None, None
+    try:
+        main.google_news.fetch_all = lambda cfg, trusted: [
+            wire_item(i, "google") for i in range(2)]
+        main.rss_feeds.fetch_all = lambda cfg: [wire_item(9, "rss")]
+        main.load_sources_cfg = fake_cfg
+        gov_mod.fetch_all = boom
+        fetched, n_new = _real_collect_cycle(make_matcher())
+    except Exception as exc:  # noqa: BLE001
+        raised = exc
+    finally:
+        (main.google_news.fetch_all, main.rss_feeds.fetch_all,
+         main.load_sources_cfg, gov_mod.fetch_all) = saved
+
+    still_configured = bool(loaded_cfg) and "gov_pages" in loaded_cfg
+    shipped_empty = loaded_cfg.get("gov_pages") == []
+    kept_file = os.path.exists(os.path.join(BASE_DIR, "src", "sources",
+                                            "gov_sites.py"))
+    check("J1 collect_cycle ไม่เรียก gov_sites แล้ว (ถึงจะยังมี gov_pages ในไฟล์) "
+          "· ยังเก็บข่าวจาก google_news/rss ได้ครบ · ไฟล์ gov_sites.py ยังอยู่",
+          raised is None and fetched == 3 and n_new == 3
+          and not hasattr(main, "gov_sites") and shipped_empty
+          and still_configured and kept_file,
+          f"raised={raised!r} fetched={fetched} new={n_new} "
+          f"main.gov_sites={hasattr(main, 'gov_sites')} "
+          f"shipped_gov_pages={loaded_cfg.get('gov_pages')!r} "
+          f"file_kept={kept_file}")
+
+    # --- J2: active_channel() is two-valued now ---------------------------
+    os.environ.pop("LINE_CHANNEL_ACCESS_TOKEN", None)
+    dry = notifier.active_channel()
+    os.environ["TELEGRAM_BOT_TOKEN"] = "should-be-ignored"
+    os.environ["TELEGRAM_CHAT_ID"] = "should-be-ignored"
+    still_dry = notifier.active_channel()
+    os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+    os.environ.pop("TELEGRAM_CHAT_ID", None)
+    with line_channel():
+        live = notifier.active_channel()
+    after = notifier.active_channel()
+    no_tg_code = not any(hasattr(notifier, n) for n in
+                         ("_send_telegram", "_telegram_post", "TELEGRAM_URL",
+                          "TELEGRAM_LIMIT"))
+    check("J2 active_channel(): มี credential -> 'line' · ไม่มี -> 'dry-run' · "
+          "ตั้ง TELEGRAM_* ไว้ก็ยัง 'dry-run' · ไม่มีโค้ด telegram เหลือ",
+          dry == "dry-run" and still_dry == "dry-run" and live == "line"
+          and after == "dry-run" and no_tg_code,
+          f"dry={dry} with_tg={still_dry} live={live} after={after} "
+          f"clean={no_tg_code}")
+
+    # --- J3: every send path still behaves, on both channels ---------------
+    blocks = ["บล็อกหนึ่ง", "บล็อกสอง", "บล็อกสาม"]
+    with line_channel() as s3:
+        ok_send = notifier.send("ข้อความสั้น")
+        ok_cnt, used_cnt = notifier.send_counted("ข้อความสั้นอีกอัน")
+        ok_blk, used_blk, cov_blk = notifier.send_blocks(blocks, max_requests=1)
+    line_ok = (ok_send and ok_cnt and used_cnt == 1 and ok_blk
+               and used_blk == 1 and cov_blk == {0, 1, 2}
+               and len(s3.calls) == 3)
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        d_send = notifier.send("ข้อความ dry-run")
+        d_ok, d_used = notifier.send_counted("ข้อความ dry-run")
+        b_ok, b_used, b_cov = notifier.send_blocks(blocks, max_requests=1)
+    printed = buf.getvalue()
+    dry_ok = (d_send is False and d_ok is False and d_used == 1
+              and b_ok is False and b_used == 1 and b_cov == {0, 1, 2}
+              and "บล็อกสาม" in printed)
+    check("J3 send/send_counted/send_blocks ยังทำงานครบทั้งสองเส้นทาง "
+          "(line ส่งจริง+นับ request · dry-run พิมพ์ออกจอ+นับเท่าเดิม)",
+          line_ok and dry_ok,
+          f"line_ok={line_ok} (send={ok_send} cnt={ok_cnt}/{used_cnt} "
+          f"blk={ok_blk}/{used_blk}/{sorted(cov_blk)} calls={len(s3.calls)}) "
+          f"dry_ok={dry_ok} (send={d_send} cnt={d_ok}/{d_used} "
+          f"blk={b_ok}/{b_used}/{sorted(b_cov)})")
+
+    # --- J4: routing survives the removal of the third channel -------------
+    m4 = make_matcher()
+    con = fresh_db()
+    try:
+        os.environ.pop("LINE_USER_ID", None)
+        rt_none = audience.realtime_targets(m4.settings, con)
+        dg_none = audience.digest_targets(m4.settings, con, 18)
+        os.environ["LINE_USER_ID"] = GOOD_ID
+        rt_priv = audience.realtime_targets(m4.settings, con)
+        dg_priv = audience.digest_targets(m4.settings, con, 18)
+        dg_priv_only = audience.digest_targets(m4.settings, con, 7)
+        os.environ["LINE_USER_ID"] = "not-a-line-id"
+        rt_bad = audience.realtime_targets(m4.settings, con)
+        report = audience.mode_report(m4.settings, con)
+    finally:
+        os.environ.pop("LINE_USER_ID", None)
+        con.close()
+
+    def keys(targets):
+        return [(t["key"], t["audience"]) for t in targets]
+
+    check("J4 audience: ไม่มี id -> ทีม(สาธารณะ)อย่างเดียว · มี id -> ส่วนตัว(เต็ม) "
+          "+ ทีมเฉพาะรอบ 18 · id ผิดรูป -> ถอยเป็นทีม · รายงานไม่เอ่ยถึง telegram",
+          keys(rt_none) == [("team", "public")]
+          and keys(dg_none) == [("team", "public")]
+          and keys(rt_priv) == [("private", "full")]
+          and keys(dg_priv) == [("private", "full"), ("team", "public")]
+          and keys(dg_priv_only) == [("private", "full")]
+          and keys(rt_bad) == [("team", "public")]
+          and "telegram" not in report.lower()
+          and ("dry-run" in report or "line" in report),
+          f"rt_none={keys(rt_none)} dg_none={keys(dg_none)} "
+          f"rt_priv={keys(rt_priv)} dg_priv={keys(dg_priv)} "
+          f"dg_7={keys(dg_priv_only)} rt_bad={keys(rt_bad)}")
+
+    # --- J5 + J6: the nudge is private, and only private -------------------
+    wl56 = [wl_entry("due7", WL_DUE_TITLE, 7, note=SENTINEL_WNOTE)]
+    with using_profile(rem_profile(wl56)):
+        m56 = sentinel_matcher(**REM_SETTINGS)
+        con = fresh_db()
+        storage.set_meta(con, "last_summary_at", "2000-01-01T00:00:00")
+        seed_secret_news(con, 2)
+        con.close()
+        s56 = run_digest_as(m56, user_id=GOOD_ID, round_hour=18)
+        priv56, pub56 = pushed(s56), broadcast(s56)
+    due_when = (now_bkk().date() + timedelta(days=7)).strftime("%d/%m/%Y")
+    due_line = f"เหลือ 7 วัน (ครบกำหนด {due_when})"
+    check("J5 deadline อีก 7 วัน -> ฉบับเต็ม (ส่วนตัว) มีบล็อก '⏰ ใกล้ครบกำหนด' "
+          "พร้อมจำนวนวันที่เหลือและวันครบกำหนด",
+          NUDGE_HEAD in priv56 and due_line in priv56 and WL_DUE_TITLE in priv56,
+          f"has_head={NUDGE_HEAD in priv56} has_line={due_line in priv56} "
+          f"has_title={WL_DUE_TITLE in priv56} priv_len={len(priv56)}")
+
+    check("J6 deadline เดียวกัน -> ฉบับสาธารณะ (broadcast) ไม่มีบล็อกนี้ "
+          "และไม่มีชื่อเรื่อง watchlist หลุดออกไปเลย",
+          bool(pub56) and NUDGE_HEAD not in pub56 and WL_DUE_TITLE not in pub56
+          and not any(sent in pub56 for sent in SENTINELS)
+          and "ตราลับ" not in pub56,
+          f"pub_len={len(pub56)} has_block={NUDGE_HEAD in pub56} "
+          f"has_title={WL_DUE_TITLE in pub56} "
+          f"sentinels={[i for i, s in enumerate(SENTINELS) if s in pub56]}")
+
+    # --- J7: overdue wording + repeat cadence ------------------------------
+    wl7 = [wl_entry("late97", WL_OVERDUE_TITLE, -97)]
+    con = fresh_db()
+    try:
+        first = reminder.nudge_block(wl7, REM_SETTINGS, con)
+        day1 = reminder.nudge_block(wl7, REM_SETTINGS, con,
+                                    now=now_bkk() + timedelta(days=1))
+        day6 = reminder.nudge_block(wl7, REM_SETTINGS, con,
+                                    now=now_bkk() + timedelta(days=6))
+        day7 = reminder.nudge_block(wl7, REM_SETTINGS, con,
+                                    now=now_bkk() + timedelta(days=7))
+    finally:
+        con.close()
+    check("J7 เลยกำหนด 97 วัน -> ขึ้น 'เลยกำหนดแล้ว 97 วัน' และสะกิดซ้ำทุก 7 วัน "
+          "ตาม watchlist_overdue_repeat_days (ไม่ใช่ทุกวัน)",
+          "เลยกำหนดแล้ว 97 วัน" in first and "ยังไม่มีการบันทึกผล" in first
+          and day1 == "" and day6 == ""
+          and "เลยกำหนดแล้ว 104 วัน" in day7,
+          f"first={first!r} day1={day1!r} day6={day6!r} day7={day7!r}")
+
+    # --- J8: nothing due -> not one byte changes ---------------------------
+    wl8 = [wl_entry("far45", "เรื่องที่ยังอีกไกล", 45),
+           wl_entry("nodl", "เรื่องที่ไม่มีกำหนด", None)]
+    con = fresh_db()
+    try:
+        empty_block = reminder.nudge_block(wl8, REM_SETTINGS, con)
+        meta_rows = con.execute(
+            "SELECT COUNT(*) FROM meta WHERE key LIKE 'wl_%'").fetchone()[0]
+    finally:
+        con.close()
+    j8_items = [{"id": 1, "title": "พาดหัวทดสอบ", "url": "https://x.test/1",
+                 "source_name": "ประชาชาติธุรกิจ", "level": "RED",
+                 "topics": ["มอก."], "impact_notes": [], "summary": "เนื้อหา."}]
+    base_full = summarizer.build_daily_summary(j8_items, wl8, "ทดสอบ",
+                                               health="ปกติ", n_rows=1)
+    with_empty = summarizer.build_daily_summary(j8_items, wl8, "ทดสอบ",
+                                                health="ปกติ", n_rows=1,
+                                                due_block=empty_block)
+    base_quiet = summarizer.build_daily_summary([], wl8, "ทดสอบ", health="ปกติ")
+    quiet_empty = summarizer.build_daily_summary([], wl8, "ทดสอบ", health="ปกติ",
+                                                 due_block=empty_block)
+    check("J8 ไม่มีตัวไหนเข้าเกณฑ์ -> ไม่มีบล็อก ไม่เขียน meta และ digest "
+          "เท่าเดิมทุกไบต์ (ทั้งวันที่มีข่าวและวันที่ไม่มีข่าว)",
+          empty_block == "" and meta_rows == 0
+          and base_full == with_empty and base_quiet == quiet_empty
+          and NUDGE_HEAD not in base_full,
+          f"block={empty_block!r} meta_rows={meta_rows} "
+          f"same_full={base_full == with_empty} "
+          f"same_quiet={base_quiet == quiet_empty}")
+
+    # --- J9: three digests a day, one nudge --------------------------------
+    wl9 = [wl_entry("due3", WL_DUE_TITLE, 3)]
+    with using_profile(rem_profile(wl9)):
+        m9 = sentinel_matcher(**REM_SETTINGS)
+        con = fresh_db()
+        storage.set_meta(con, "last_summary_at", "2000-01-01T00:00:00")
+        seed_secret_news(con, 2)
+        con.close()
+        round1 = pushed(run_digest_as(m9, user_id=GOOD_ID))
+        con = storage.connect()
+        storage.set_meta(con, "last_summary_at", "2000-01-01T00:00:00")
+        con.close()
+        round2 = pushed(run_digest_as(m9, user_id=GOOD_ID))
+        con = storage.connect()
+        try:
+            keys_written = [r[0] for r in con.execute(
+                "SELECT key FROM meta WHERE key LIKE 'wl_nudge_%'").fetchall()]
+        finally:
+            con.close()
+    check("J9 สะกิดแล้ว รอบถัดไปในวันเดียวกันไม่สะกิดซ้ำ (meta กันไว้) "
+          "และ digest รอบสองยังส่งตามปกติ",
+          NUDGE_HEAD in round1 and NUDGE_HEAD not in round2
+          and "สรุปข่าวเหล็ก" in round2 and len(keys_written) == 1,
+          f"r1={NUDGE_HEAD in round1} r2={NUDGE_HEAD in round2} "
+          f"r2_is_digest={'สรุปข่าวเหล็ก' in round2} keys={keys_written}")
+
+    # --- J10: entries without a usable deadline ----------------------------
+    wl10 = [wl_entry("nodl", "เรื่องที่ไม่มีกำหนด", None),
+            {"id": "junk", "title": "วันที่พัง", "deadline": "ไม่ทราบ"},
+            {"id": "empty", "title": "วันที่ว่าง", "deadline": ""},
+            "ไม่ใช่ dict เลย"]
+    con = fresh_db()
+    raised10, block10, empty10, none10 = None, None, None, None
+    try:
+        block10 = reminder.nudge_block(wl10, REM_SETTINGS, con)
+        empty10 = reminder.nudge_block([], REM_SETTINGS, con)
+        none10 = reminder.nudge_block(None, None, None)
+    except Exception as exc:  # noqa: BLE001
+        raised10 = exc
+    finally:
+        con.close()
+    check("J10 watchlist ไม่มี deadline / วันที่พัง / ว่าง / ไม่ใช่ dict -> "
+          "ไม่ crash และไม่มีบล็อก",
+          raised10 is None and block10 == "" and empty10 == "" and none10 == "",
+          f"raised={raised10!r} block={block10!r} empty={empty10!r} "
+          f"none={none10!r}")
+
+    # --- J11: the nudge is free -------------------------------------------
+    wl11 = [wl_entry("due1", WL_DUE_TITLE, 1),
+            wl_entry("late30", WL_OVERDUE_TITLE, -30)]
+    with using_profile(rem_profile(wl11)):
+        m11 = sentinel_matcher(**REM_SETTINGS)
+        con = fresh_db()
+        storage.set_meta(con, "last_summary_at", "2000-01-01T00:00:00")
+        seed_secret_news(con, 3)
+        con.close()
+        s11 = run_digest_as(m11, user_id=GOOD_ID)      # private-only round
+        con = storage.connect()
+        day_req = quota._get_int(con, quota.day_key())
+        con.close()
+        text11 = pushed(s11)
+    check("J11 digest ที่มีบล็อกนี้ยังใช้ LINE 1 request เท่าเดิม "
+          "(บล็อกเดินทางไปกับ digest ที่ส่งอยู่แล้ว)",
+          NUDGE_HEAD in text11 and WL_OVERDUE_TITLE in text11
+          and len(s11.calls) == 1 and day_req == 1,
+          f"has_block={NUDGE_HEAD in text11} calls={len(s11.calls)} "
+          f"day_req={day_req}")
+
+    # --- J12: a dead database may not take the switch down -----------------
+    wl12 = [wl_entry("late97", WL_OVERDUE_TITLE, -97)]
+    raised12, block12 = None, None
+    try:
+        block12 = reminder.nudge_block(wl12, REM_SETTINGS, DeadCon())
+    except Exception as exc:  # noqa: BLE001
+        raised12 = exc
+    saved_quota_status = notifier.line_quota_status
+    notifier.line_quota_status = lambda: (None, None)
+    saved_connect = storage.connect
+    broken = lambda *a, **k: (_ for _ in ()).throw(  # noqa: E731
+        RuntimeError("tenant or user not found"))
+    raised_job, s12 = None, None
+    try:
+        storage.connect = broken
+        with using_profile(rem_profile(wl12)):
+            m12 = sentinel_matcher(**REM_SETTINGS)
+            with line_channel(user_id=GOOD_ID) as s12:
+                main.daily_summary_job(m12, "ทดสอบ", 18)
+    except Exception as exc:  # noqa: BLE001
+        raised_job = exc
+    finally:
+        storage.connect = saved_connect
+        notifier.line_quota_status = saved_quota_status
+    switch_text = "\n".join(m["text"] for c in (s12.calls if s12 else [])
+                            for m in c["payload"]["messages"])
+    check("J12 DB ล่ม -> ฟังก์ชันเตือน watchlist ไม่ raise (ยังสะกิดได้) และ "
+          "dead-man's switch ยังส่งได้ตามปกติ โดยไม่พาชื่อเรื่องภายในออกไป",
+          raised12 is None and "เลยกำหนดแล้ว 97 วัน" in (block12 or "")
+          and raised_job is None
+          and "ระบบเฝ้าข่าวขัดข้อง" in switch_text
+          and WL_OVERDUE_TITLE not in switch_text,
+          f"raised={raised12!r} block={block12!r} raised_job={raised_job!r} "
+          f"switch={'ระบบเฝ้าข่าวขัดข้อง' in switch_text}")
+
+
+# =========================================================================
 
 def main_test():
     if hasattr(sys.stdout, "reconfigure"):
@@ -2292,6 +2674,7 @@ def main_test():
         section_g()
         section_h()
         section_i()
+        section_j()
     finally:
         storage.connect = _real_connect
         shutil.rmtree(TMP_DIR, ignore_errors=True)

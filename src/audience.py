@@ -10,7 +10,7 @@ plant runs, which standards it is exposed to, where it sits), and the digest
 carries the watchlist, which is a list of what this company is afraid of.
 
 So a message exists in two versions:
-  * audience="full"   -> the private destination (LINE_USER_ID push / Telegram)
+  * audience="full"   -> the private destination (LINE_USER_ID push)
   * audience="public" -> the team broadcast: the NEWS, without the reading of it
 
 HOW THE SECRET IS KEPT (read this before changing anything here)

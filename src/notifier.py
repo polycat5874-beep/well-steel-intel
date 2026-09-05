@@ -1,13 +1,19 @@
 # -*- coding: utf-8 -*-
 """Notifier module - swappable by design.
 
-Primary channel: LINE Messaging API (LINE Official Account, Push Message).
-Fallback channel: Telegram Bot (kept for flexibility / testing).
+Only channel: LINE Messaging API (LINE Official Account, Push/Broadcast).
 
-Channel selection (in order):
-  1. LINE      if LINE_CHANNEL_ACCESS_TOKEN + LINE_USER_ID are set
-  2. Telegram  if TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID are set
-  3. DRY-RUN   otherwise -> message printed to console/log (used for tests)
+Channel selection:
+  1. LINE      if a token (or channel id + secret to mint one) is configured
+  2. DRY-RUN   otherwise -> message printed to console/log (used for tests)
+
+A Telegram fallback used to sit between those two. It was removed on 2026-09-05
+(Phase 7a): no TELEGRAM_* variable ever existed in .env or in the GitHub
+secrets, so the branch had never once executed, yet every caller still had to
+reason about a third channel with different quota rules, different recipient
+semantics ("to" is a LINE concept) and a different audience classification.
+active_channel() is therefore now TWO-VALUED - "line" or "dry-run" - and callers
+may rely on that: anything that is not "line" puts nothing on the wire.
 
 Note on the LINE free-tier quota: LINE bills (number of API requests) x (number
 of recipients), NOT the number of message objects. One request may carry up to 5
@@ -18,7 +24,6 @@ a long text is chunked (`_chunk`) and whole alert cards are packed with
 """
 import logging
 import os
-import time
 
 import requests
 
@@ -39,10 +44,6 @@ _token_cache = {"token": None}  # in-process cache for an auto-issued token
 # Sentinel for "send this to everyone who added the OA", as opposed to None,
 # which means "whatever LINE_USER_ID says" (the behaviour that shipped first).
 BROADCAST = "__broadcast__"
-
-# --- Telegram (fallback) ---
-TELEGRAM_URL = "https://api.telegram.org/bot{token}/sendMessage"
-TELEGRAM_LIMIT = 4000       # Telegram hard limit is 4096 chars per message
 
 
 def _resolve_target(to):
@@ -198,27 +199,13 @@ def _line_token(force_refresh=False):
 
 
 def active_channel():
-    """Return the name of the channel that send() will use right now."""
-    if _line_configured():
-        return "line"
-    if os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID"):
-        return "telegram"
-    return "dry-run"
+    """Return the name of the channel that send() will use right now.
 
-
-def _post_with_retry(url, *, headers, json=None, data=None, label=""):
-    """POST with up to 3 attempts + backoff. Returns True on success."""
-    for attempt in range(1, 4):
-        try:
-            resp = requests.post(url, headers=headers, json=json, data=data, timeout=20)
-            resp.raise_for_status()
-            return True
-        except requests.RequestException as exc:
-            body = getattr(getattr(exc, "response", None), "text", "")
-            log.warning("%s send failed (%d/3): %s %s", label, attempt, exc, body[:300])
-            if attempt < 3:
-                time.sleep(3 * attempt)
-    return False
+    Exactly two values: "line" (credentials present, messages really go out) or
+    "dry-run" (nothing leaves the process). Callers that used to test for a
+    third channel can simply test for "line".
+    """
+    return "line" if _line_configured() else "dry-run"
 
 
 def _line_post(url, payload, token):
@@ -289,29 +276,8 @@ def _send_line(text, to=None):
     return _send_line_requests(_line_plan_for_text(text), to=to)
 
 
-def _telegram_post(text):
-    """One Telegram message. Returns True on success."""
-    return _post_with_retry(
-        TELEGRAM_URL.format(token=os.getenv("TELEGRAM_BOT_TOKEN")),
-        headers={},
-        data={"chat_id": os.getenv("TELEGRAM_CHAT_ID"), "text": text,
-              "disable_web_page_preview": True},
-        label="telegram",
-    )
-
-
-def _send_telegram(text):
-    """Returns (ok, n_requests). Telegram has no push quota, so one message per
-    chunk is fine."""
-    ok, used = True, 0
-    for chunk in _chunk(text, TELEGRAM_LIMIT):
-        ok = _telegram_post(chunk) and ok
-        used += 1
-    return ok, used
-
-
 def _dry_run(text):
-    log.info("DRY-RUN (no LINE/Telegram credentials) - message:")
+    log.info("DRY-RUN (no LINE credentials) - message:")
     print("\n" + "=" * 64)
     print(text)
     print("=" * 64)
@@ -323,17 +289,9 @@ def send_counted(text, to=None):
 
     Returns (ok, n_requests). The count is what the quota bookkeeping records;
     on dry-run it is the number of requests the message WOULD have cost, so
-    local runs still exercise the budget logic.
-
-    Telegram note: `to` is a LINE concept. Telegram always delivers to the one
-    configured chat, which is by definition a SPECIFIC destination, so it counts
-    as a private channel - a public-audience message landing there is merely
-    less detailed than it could be, never a leak."""
-    channel = active_channel()
-    if channel == "line":
+    local runs still exercise the budget logic."""
+    if active_channel() == "line":
         return _send_line(text, to=to)
-    if channel == "telegram":
-        return _send_telegram(text)
     return _dry_run(text), len(_line_plan_for_text(text))
 
 
@@ -368,17 +326,8 @@ def send_blocks(blocks, max_requests=None, to=None):
         dropped_idx |= set(req["blocks"])
     covered = sent_idx - dropped_idx
 
-    channel = active_channel()
-    if channel == "line":
+    if active_channel() == "line":
         ok, used = _send_line_requests([r["objects"] for r in taken], to=to)
-        return ok, used, covered
-    if channel == "telegram":
-        ok, used = True, 0
-        for req in taken:
-            for obj in req["objects"]:
-                for chunk in _chunk(obj, TELEGRAM_LIMIT):
-                    ok = _telegram_post(chunk) and ok
-                    used += 1
         return ok, used, covered
     for req in taken:
         for obj in req["objects"]:
